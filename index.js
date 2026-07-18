@@ -13,6 +13,7 @@ const DATA_KEY = "time-list-data.json";
 const SETTINGS_KEY = "time-list-settings.json";
 const DOCK_TYPE = "time-list";
 const PIE_COLORS = ["#5b8def", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#f97316", "#84cc16"];
+const WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const ICONS = `
   <symbol id="iconTimeList" viewBox="0 0 32 32">
     <path d="M16 3a13 13 0 1 0 0 26 13 13 0 0 0 0-26Zm0 23.5A10.5 10.5 0 1 1 16 5.5a10.5 10.5 0 0 1 0 21Z"/>
@@ -60,7 +61,7 @@ class TimeListPlugin extends Plugin {
     this.createTaskDialog = null;
     this.completeTaskDialog = null;
     this.currentDockView = "tasks";
-    this.calendarMode = "day";
+    this.calendarMode = "week";
     this.calendarDate = todayKey();
     this.timerHandle = null;
     this.autoSyncTimer = null;
@@ -1200,28 +1201,110 @@ class TimeListPlugin extends Plugin {
 
   renderCalendarView() {
     const tasks = this.getCalendarTasks();
-    const completedTasks = tasks.filter((task) => normalizeTaskStatus(task) === "completed");
-    const total = completedTasks.reduce((sum, task) => sum + (task.actualMinutes || 0), 0);
 
     return `
       <div class="time-list-calendar">
-        <div class="time-list-calendar-nav">
+        ${this.renderCalendarToolbar()}
+      </div>
+      <div class="time-list-calendar-stage">
+        ${
+          this.calendarMode === "month"
+            ? this.renderCalendarMonthView(tasks)
+            : this.calendarMode === "year"
+              ? this.renderCalendarYearView(tasks)
+              : this.renderCalendarWeekView(tasks)
+        }
+      </div>
+    `;
+  }
+
+  renderCalendarToolbar() {
+    return `
+      <div class="time-list-calendar-toolbar">
+        <div class="time-list-calendar-title-row">
           ${iconButton("iconTlChevronLeft", "calendar-prev", "上一个")}
-          <strong>${escapeHtml(formatCalendarTitle(this.calendarDate, this.calendarMode))}</strong>
           ${iconButton("iconTlChevronRight", "calendar-next", "下一个")}
+          ${icon("iconTlCalendar")}
+          <strong>${escapeHtml(formatCalendarTitle(this.calendarDate, this.calendarMode))}</strong>
+          ${iconButton("iconTlRefresh", "calendar-refresh", "刷新")}
         </div>
         <div class="time-list-calendar-modes">
-          ${["day", "week", "month", "year"].map((mode) => `
+          ${["week", "month", "year"].map((mode) => `
             <button class="${this.calendarMode === mode ? "is-active" : ""}" data-action="calendar-mode" data-mode="${mode}">${calendarModeLabel(mode)}</button>
           `).join("")}
         </div>
-        <div class="time-list-metrics time-list-metrics--two">
-          <div><span>任务数</span><strong>${tasks.length}</strong></div>
-          <div><span>完成用时</span><strong>${formatMinutes(total)}</strong></div>
+      </div>
+    `;
+  }
+
+  renderCalendarWeekView(tasks) {
+    const dates = getWeekDates(this.calendarDate);
+    const weekLabel = `第${getIsoWeekNumber(parseDateKey(this.calendarDate))}周`;
+    return `
+      <div class="time-list-calendar-grid-wrap">
+        <div class="time-list-calendar-week-grid">
+          <div class="time-list-calendar-week-head time-list-calendar-week-no">${weekLabel}</div>
+          ${dates.map((date) => `<div class="time-list-calendar-week-head">${formatMonthDayWeek(date)}</div>`).join("")}
+          <div class="time-list-calendar-all-day">全天</div>
+          ${dates.map((date) => `
+            <div class="time-list-calendar-day-cell ${date === todayKey() ? "is-today" : ""}">
+              ${this.renderCalendarEventsForDate(date, tasks)}
+            </div>
+          `).join("")}
         </div>
       </div>
-      <div class="time-list-scroll">
-        ${this.renderCalendarTaskGroups(tasks)}
+    `;
+  }
+
+  renderCalendarMonthView(tasks) {
+    const dates = getMonthGridDates(this.calendarDate);
+    return `
+      <div class="time-list-calendar-grid-wrap">
+        <div class="time-list-calendar-month-grid">
+          ${WEEKDAY_SHORT.map((day) => `<div class="time-list-calendar-month-head">${day}</div>`).join("")}
+          ${dates.map((date, index) => `
+            <div class="time-list-calendar-month-cell ${date.slice(0, 7) !== this.calendarDate.slice(0, 7) ? "is-outside" : ""} ${date === todayKey() ? "is-today" : ""}">
+              ${index % 7 === 0 ? `<span class="time-list-calendar-week-badge">第${getIsoWeekNumber(parseDateKey(date))}周</span>` : ""}
+              <div class="time-list-calendar-date-num">${Number(date.slice(8))}日</div>
+              ${this.renderCalendarEventsForDate(date, tasks)}
+            </div>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  }
+
+  renderCalendarYearView(tasks) {
+    const year = Number(this.calendarDate.slice(0, 4));
+    return `
+      <div class="time-list-calendar-year">
+        ${Array.from({ length: 12 }, (_, index) => {
+          const month = String(index + 1).padStart(2, "0");
+          const monthKey = `${year}-${month}`;
+          const completedCount = tasks.filter((task) => {
+            return (task.date || "").slice(0, 7) === monthKey && normalizeTaskStatus(task) === "completed";
+          }).length;
+          return `
+            <button class="time-list-calendar-month-card" data-action="calendar-jump-month" data-date="${monthKey}-01">
+              <strong>${index + 1}月</strong>
+              <span>${completedCount}</span>
+            </button>
+          `;
+        }).join("")}
+      </div>
+    `;
+  }
+
+  renderCalendarEventsForDate(date, tasks) {
+    const dateTasks = sortTasksForDisplay(tasks.filter((task) => task.date === date));
+    return dateTasks.map((task) => this.renderCalendarEvent(task)).join("");
+  }
+
+  renderCalendarEvent(task) {
+    const status = normalizeTaskStatus(task);
+    return `
+      <div class="time-list-calendar-event time-list-calendar-event--${status}" title="${escapeAttr(task.title)}">
+        <strong>${taskCalendarMark(status)} ${escapeHtml(task.title)}</strong>
       </div>
     `;
   }
@@ -1320,21 +1403,6 @@ class TimeListPlugin extends Plugin {
     `;
   }
 
-  renderCalendarTaskGroups(tasks) {
-    if (tasks.length === 0) {
-      return `<div class="time-list-empty">这个范围里还没有任务。</div>`;
-    }
-    const groups = groupTasksByDate(tasks);
-    return groups.map(([date, dateTasks]) => `
-      <div>
-        <div class="time-list-section-title">${date} · ${dateTasks.length}</div>
-        <div class="time-list-items">
-          ${sortTasksForDisplay(dateTasks).map((task) => this.renderTaskItem(task)).join("")}
-        </div>
-      </div>
-    `).join("");
-  }
-
   renderTaskItem(task) {
     const pomodoroMinutes = totalPomodoroMinutes(task);
     const status = normalizeTaskStatus(task);
@@ -1402,7 +1470,6 @@ class TimeListPlugin extends Plugin {
       await this.importHabitsForToday({ silent: false });
       this.render();
     });
-
     root.querySelectorAll("[data-action]").forEach((button) => {
       const action = button.dataset.action;
       if (["open-setting", "open-create-task", "refresh"].includes(action)) {
@@ -1416,13 +1483,24 @@ class TimeListPlugin extends Plugin {
           this.currentDockView = button.dataset.view || "tasks";
           this.render();
         } else if (action === "calendar-mode") {
-          this.calendarMode = button.dataset.mode || "day";
+          this.calendarMode = button.dataset.mode || "week";
+          if (this.calendarMode === "week") {
+            this.calendarDate = todayKey();
+          }
           this.render();
         } else if (action === "calendar-prev") {
           this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, -1);
           this.render();
         } else if (action === "calendar-next") {
           this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
+          this.render();
+        } else if (action === "calendar-refresh") {
+          await this.syncTodayFromDailyNote({ silent: true });
+          await this.importHabitsForToday({ silent: false });
+          this.render();
+        } else if (action === "calendar-jump-month") {
+          this.calendarDate = button.dataset.date || this.calendarDate;
+          this.calendarMode = "month";
           this.render();
         } else if (action === "start-pomodoro") {
           await this.startPomodoro(taskId);
@@ -1697,18 +1775,6 @@ function sortTasksForDisplay(tasks) {
     .map((item) => item.task);
 }
 
-function groupTasksByDate(tasks) {
-  const map = new Map();
-  tasks.forEach((task) => {
-    const date = task.date || todayKey();
-    if (!map.has(date)) {
-      map.set(date, []);
-    }
-    map.get(date).push(task);
-  });
-  return [...map.entries()].sort(([leftDate], [rightDate]) => rightDate.localeCompare(leftDate));
-}
-
 function isTaskInCalendarRange(task, selectedDate, mode) {
   const date = task.date || "";
   if (mode === "year") {
@@ -1755,17 +1821,20 @@ function formatDateKey(date) {
 }
 
 function formatCalendarTitle(dateKey, mode) {
+  const date = parseDateKey(dateKey);
   if (mode === "year") {
-    return dateKey.slice(0, 4);
+    return `${date.getFullYear()}年`;
   }
   if (mode === "month") {
-    return dateKey.slice(0, 7);
+    return `${date.getFullYear()}年${date.getMonth() + 1}月`;
   }
   if (mode === "week") {
     const [start, end] = getWeekRange(dateKey);
-    return `${formatDateKey(start)} ~ ${formatDateKey(end)}`;
+    const sameMonth = start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth();
+    const endText = sameMonth ? `${end.getDate()}日` : `${end.getMonth() + 1}月${end.getDate()}日`;
+    return `${start.getFullYear()}年${start.getMonth() + 1}月${start.getDate()}日 - ${endText}`;
   }
-  return dateKey;
+  return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日`;
 }
 
 function calendarModeLabel(mode) {
@@ -1778,7 +1847,7 @@ function calendarModeLabel(mode) {
   if (mode === "week") {
     return "周";
   }
-  return "日";
+  return "周";
 }
 
 function getWeekRange(dateKey) {
@@ -1791,6 +1860,52 @@ function getWeekRange(dateKey) {
   end.setDate(start.getDate() + 6);
   end.setHours(23, 59, 59, 999);
   return [start, end];
+}
+
+function getWeekDates(dateKey) {
+  const [start] = getWeekRange(dateKey);
+  return Array.from({ length: 7 }, (_, index) => {
+    const date = new Date(start);
+    date.setDate(start.getDate() + index);
+    return formatDateKey(date);
+  });
+}
+
+function getMonthGridDates(dateKey) {
+  const date = parseDateKey(dateKey);
+  const first = new Date(date.getFullYear(), date.getMonth(), 1);
+  const firstWeekDay = first.getDay() || 7;
+  const start = new Date(first);
+  start.setDate(first.getDate() - firstWeekDay + 1);
+  return Array.from({ length: 42 }, (_, index) => {
+    const current = new Date(start);
+    current.setDate(start.getDate() + index);
+    return formatDateKey(current);
+  });
+}
+
+function getIsoWeekNumber(date) {
+  const current = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const day = current.getUTCDay() || 7;
+  current.setUTCDate(current.getUTCDate() + 4 - day);
+  const yearStart = new Date(Date.UTC(current.getUTCFullYear(), 0, 1));
+  return Math.ceil((((current - yearStart) / 86400000) + 1) / 7);
+}
+
+function formatMonthDayWeek(dateKey) {
+  const date = parseDateKey(dateKey);
+  const weekday = WEEKDAY_SHORT[(date.getDay() || 7) - 1];
+  return `${date.getMonth() + 1}/${date.getDate()}${weekday}`;
+}
+
+function taskCalendarMark(status) {
+  if (status === "completed") {
+    return "✅";
+  }
+  if (status === "abandoned") {
+    return "❌";
+  }
+  return "⬜";
 }
 
 function normalizeTaskStatus(task) {
