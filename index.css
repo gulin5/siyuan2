@@ -80,7 +80,7 @@
 
 .time-list-tabs {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   padding: 3px;
   border-radius: 12px;
@@ -255,6 +255,14 @@
   line-height: 1.22;
 }
 
+.time-list-item-summary {
+  margin: -2px 9px 4px;
+  color: var(--b3-theme-on-surface-light);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .time-list-actions {
   display: flex;
   align-items: center;
@@ -317,6 +325,53 @@
 
 .time-list-metrics--two {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.time-list-calendar {
+  display: grid;
+  gap: 8px;
+}
+
+.time-list-calendar-nav {
+  display: grid;
+  grid-template-columns: 30px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 8px;
+}
+
+.time-list-calendar-nav strong {
+  overflow: hidden;
+  color: var(--b3-theme-on-background);
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.time-list-calendar-modes {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+  padding: 3px;
+  border-radius: 10px;
+  background: var(--time-list-softer-surface);
+}
+
+.time-list-calendar-modes button {
+  border: 0;
+  border-radius: 8px;
+  padding: 5px 0;
+  color: var(--b3-theme-on-surface-light);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.time-list-calendar-modes button.is-active {
+  color: var(--b3-theme-on-background);
+  background: var(--b3-theme-background);
 }
 
 .time-list-chart-body {
@@ -506,6 +561,12 @@
   min-height: 150px;
   resize: vertical;
   line-height: 1.55;
+}
+
+.time-list-summary-textarea {
+  min-height: 82px;
+  resize: vertical;
+  line-height: 1.5;
 }
 
 .time-list-dialog-mode {

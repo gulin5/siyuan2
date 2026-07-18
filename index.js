@@ -32,6 +32,9 @@ const ICONS = `
   <symbol id="iconTlTrash" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-.8 11H7.8L7 9Z"/></symbol>
   <symbol id="iconTlSettings" viewBox="0 0 24 24"><path d="M19.4 13.5a7.8 7.8 0 0 0 0-3l2-1.5-2-3.5-2.4 1a8 8 0 0 0-2.6-1.5L14 2h-4l-.4 3a8 8 0 0 0-2.6 1.5l-2.4-1-2 3.5 2 1.5a7.8 7.8 0 0 0 0 3l-2 1.5 2 3.5 2.4-1a8 8 0 0 0 2.6 1.5l.4 3h4l.4-3a8 8 0 0 0 2.6-1.5l2.4 1 2-3.5-2-1.5ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></symbol>
   <symbol id="iconTlRefresh" viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></symbol>
+  <symbol id="iconTlCalendar" viewBox="0 0 24 24"><path d="M7 2h2v3h6V2h2v3h3v16H4V5h3V2Zm11 8H6v9h12v-9ZM6 7v1h12V7H6Zm2 5h3v3H8v-3Z"/></symbol>
+  <symbol id="iconTlChevronLeft" viewBox="0 0 24 24"><path d="m14.7 6.3 1.4 1.4L11.8 12l4.3 4.3-1.4 1.4L9 12l5.7-5.7Z"/></symbol>
+  <symbol id="iconTlChevronRight" viewBox="0 0 24 24"><path d="m9.3 17.7-1.4-1.4 4.3-4.3-4.3-4.3 1.4-1.4L15 12l-5.7 5.7Z"/></symbol>
 `;
 
 const defaultSettings = {
@@ -57,7 +60,11 @@ class TimeListPlugin extends Plugin {
     this.createTaskDialog = null;
     this.completeTaskDialog = null;
     this.currentDockView = "tasks";
+    this.calendarMode = "day";
+    this.calendarDate = todayKey();
     this.timerHandle = null;
+    this.autoSyncTimer = null;
+    this.boundWsMainHandler = null;
     this.isMobile = false;
   }
 
@@ -69,6 +76,8 @@ class TimeListPlugin extends Plugin {
       hotkey: "",
       callback: () => this.openDock(),
     });
+    this.boundWsMainHandler = (event) => this.handleWsMain(event);
+    this.eventBus.on("ws-main", this.boundWsMainHandler);
   }
 
   async onLayoutReady() {
@@ -76,6 +85,7 @@ class TimeListPlugin extends Plugin {
       await this.loadAllData();
       this.registerDock();
       await this.setupSettings();
+      await this.syncTodayFromDailyNote({ silent: true });
       await this.importHabitsForToday({ silent: true });
       this.startTicker();
       showMessage("日记任务计时插件已加载");
@@ -87,6 +97,11 @@ class TimeListPlugin extends Plugin {
 
   onunload() {
     this.stopTicker();
+    this.stopAutoSync();
+    if (this.boundWsMainHandler) {
+      this.eventBus.off("ws-main", this.boundWsMainHandler);
+      this.boundWsMainHandler = null;
+    }
     if (this.settingDialog) {
       this.settingDialog.destroy();
       this.settingDialog = null;
@@ -173,6 +188,7 @@ class TimeListPlugin extends Plugin {
         this.settings.habitDocId = habitDocInput.value.trim();
         this.settings.autoImportHabits = habitToggle.checked;
         await this.saveSettings();
+        await this.syncTodayFromDailyNote({ silent: true });
         await this.importHabitsForToday({ silent: false });
         this.render();
         showMessage("日记任务计时设置已保存");
@@ -320,7 +336,9 @@ class TimeListPlugin extends Plugin {
         this.element.style.height = "100%";
         plugin.dockElement = this.element;
         plugin.render();
-        plugin.importHabitsForToday({ silent: true }).then(() => plugin.render());
+        plugin.syncTodayFromDailyNote({ silent: true })
+          .then(() => plugin.importHabitsForToday({ silent: true }))
+          .then(() => plugin.render());
       },
       destroy() {
         if (plugin.dockElement === this.element) {
@@ -355,6 +373,31 @@ class TimeListPlugin extends Plugin {
     }
   }
 
+  stopAutoSync() {
+    if (this.autoSyncTimer) {
+      window.clearTimeout(this.autoSyncTimer);
+      this.autoSyncTimer = null;
+    }
+  }
+
+  handleWsMain(event) {
+    if (!this.dockElement || !this.settings.notebookId || !shouldSyncFromWsEvent(event, this.state.tasks)) {
+      return;
+    }
+    this.scheduleAutoSync();
+  }
+
+  scheduleAutoSync() {
+    this.stopAutoSync();
+    this.autoSyncTimer = window.setTimeout(async () => {
+      this.autoSyncTimer = null;
+      await this.syncTodayFromDailyNote({ silent: true });
+      if (this.dockElement) {
+        this.render();
+      }
+    }, 450);
+  }
+
   async request(path, payload = {}) {
     const response = await fetchSyncPost(path, payload);
     if (!response || response.code !== 0) {
@@ -382,11 +425,11 @@ class TimeListPlugin extends Plugin {
 
   async appendDailyNote(markdown) {
     if (!this.canWriteDailyNote()) {
-      return;
+      return null;
     }
     const notebook = await this.ensureNotebookId();
     try {
-      await this.request("/api/block/appendDailyNoteBlock", {
+      return await this.request("/api/block/appendDailyNoteBlock", {
         notebook,
         dataType: "markdown",
         data: markdown,
@@ -400,12 +443,183 @@ class TimeListPlugin extends Plugin {
       if (!parentID) {
         throw error;
       }
-      await this.request("/api/block/appendBlock", {
+      return await this.request("/api/block/appendBlock", {
         parentID,
         dataType: "markdown",
         data: markdown,
       });
     }
+  }
+
+  async writeTaskToDailyNote(task, status = normalizeTaskStatus(task), options = {}) {
+    if (!this.canWriteDailyNote()) {
+      return false;
+    }
+    const markdown = formatDailyTaskRecord(task, status, options);
+    let changed = false;
+    if (!task.blockId) {
+      task.blockId = await this.findDailyTaskBlockId(task);
+      changed = Boolean(task.blockId);
+    }
+    if (task.blockId) {
+      try {
+        await this.request("/api/block/updateBlock", {
+          id: task.blockId,
+          dataType: "markdown",
+          data: markdown,
+        });
+        return changed;
+      } catch (error) {
+        console.warn("[siyuan-time-list] failed to update task block, append instead", error);
+        task.blockId = "";
+        changed = true;
+      }
+    }
+    const result = await this.appendDailyNote(markdown);
+    const blockId = extractBlockId(result);
+    if (blockId) {
+      task.blockId = blockId;
+      return true;
+    }
+    task.blockId = await this.findDailyTaskBlockId(task);
+    return Boolean(task.blockId) || changed;
+  }
+
+  async findDailyTaskBlockId(task) {
+    const rows = await this.queryDailyTaskBlocks(task.date || todayKey());
+    const records = parseDailyTaskRecordsFromRows(rows)
+      .filter((record) => record.date === (task.date || todayKey()))
+      .filter((record) => normalizeTitleKey(record.title) === normalizeTitleKey(task.title))
+      .filter((record) => record.blockId);
+    return records.at(-1)?.blockId || "";
+  }
+
+  async writeTasksToDailyNote(tasks) {
+    let changed = false;
+    for (const task of tasks) {
+      changed = await this.writeTaskToDailyNote(task) || changed;
+    }
+    if (changed) {
+      await this.saveState();
+    }
+  }
+
+  async deleteDailyTaskBlock(task) {
+    if (!task.blockId) {
+      return;
+    }
+    try {
+      await this.request("/api/block/deleteBlock", { id: task.blockId });
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to delete task block", error);
+    }
+  }
+
+  async queryDailyTaskBlocks(date) {
+    if (!this.settings.notebookId) {
+      return [];
+    }
+    const notebook = await this.ensureNotebookId();
+    const stmt = [
+      "select id, markdown, content, created, updated from blocks",
+      `where box = '${escapeSql(notebook)}'`,
+      "and type <> 'd'",
+      `and (markdown like '%📅${escapeSql(date)}%' or content like '%📅${escapeSql(date)}%')`,
+      "order by created asc",
+    ].join(" ");
+    const rows = await this.request("/api/query/sql", { stmt });
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  async syncTodayFromDailyNote({ silent = true } = {}) {
+    if (!this.settings.notebookId) {
+      return 0;
+    }
+    const date = todayKey();
+    let rows = [];
+    try {
+      rows = await this.queryDailyTaskBlocks(date);
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to sync daily note", error);
+      if (!silent) {
+        showMessage(`同步今日日记失败：${error.message}`, 5000, "error");
+      }
+      return 0;
+    }
+    const records = parseDailyTaskRecordsFromRows(rows).filter((record) => record.date === date);
+    const changed = this.mergeDailyTaskRecords(records, date);
+    if (changed) {
+      await this.saveState();
+    }
+    if (!silent) {
+      showMessage(changed ? "已同步今日日记" : "今日日记已是最新");
+    }
+    return records.length;
+  }
+
+  mergeDailyTaskRecords(records, date) {
+    let changed = false;
+    const byBlockId = new Map(this.state.tasks.filter((task) => task.blockId).map((task) => [task.blockId, task]));
+    const byKey = new Map(this.state.tasks.map((task) => [`${task.date || date}|${normalizeTitleKey(task.title)}`, task]));
+    const seenBlockIds = new Set(records.map((record) => record.blockId).filter(Boolean));
+
+    records.forEach((record) => {
+      const key = `${record.date}|${normalizeTitleKey(record.title)}`;
+      let task = record.blockId ? byBlockId.get(record.blockId) : null;
+      task = task || byKey.get(key);
+      if (!task) {
+        task = {
+          id: createId(),
+          title: record.title,
+          date: record.date,
+          status: record.status,
+          source: "daily-note",
+          blockId: record.blockId,
+          createdAt: record.createdAt || new Date().toISOString(),
+          completedAt: record.status === "completed" ? new Date().toISOString() : "",
+          abandonedAt: record.status === "abandoned" ? new Date().toISOString() : "",
+          actualMinutes: record.actualMinutes,
+          completionMode: record.status === "completed" ? "document" : "",
+          pomodoros: [],
+          note: record.status === "completed" ? "文档同步" : "",
+          summary: record.summary,
+        };
+        this.state.tasks.unshift(task);
+        changed = true;
+        return;
+      }
+
+      const nextValues = {
+        title: record.title,
+        date: record.date,
+        status: record.status,
+        blockId: record.blockId || task.blockId || "",
+        actualMinutes: record.actualMinutes,
+        completedAt: record.status === "completed" ? (task.completedAt || new Date().toISOString()) : "",
+        abandonedAt: record.status === "abandoned" ? (task.abandonedAt || new Date().toISOString()) : "",
+        completionMode: record.status === "completed" ? (task.completionMode || "document") : "",
+        note: record.status === "completed" ? (task.note || "文档同步") : record.status === "abandoned" ? "已放弃" : "",
+        summary: record.summary,
+      };
+      Object.entries(nextValues).forEach(([field, value]) => {
+        if (task[field] !== value) {
+          task[field] = value;
+          changed = true;
+        }
+      });
+    });
+
+    const before = this.state.tasks.length;
+    this.state.tasks = this.state.tasks.filter((task) => {
+      return !(task.date === date && task.blockId && !seenBlockIds.has(task.blockId));
+    });
+    if (this.state.tasks.length !== before) {
+      if (this.state.activePomodoro && !this.findTask(this.state.activePomodoro.taskId)) {
+        this.state.activePomodoro = null;
+      }
+      changed = true;
+    }
+    return changed;
   }
 
   canWriteDailyNote() {
@@ -469,14 +683,14 @@ class TimeListPlugin extends Plugin {
       completionMode: "",
       pomodoros: [],
       note: "",
+      summary: "",
     }));
 
     this.state.tasks.unshift(...tasks);
     await this.saveState();
 
     try {
-      const markdown = tasks.map((task) => `* [ ] ${escapeMarkdown(task.title)} #习惯任务#`).join("\n") + "\n";
-      await this.appendDailyNote(markdown);
+      await this.writeTasksToDailyNote(tasks);
     } catch (error) {
       console.warn("[siyuan-time-list] failed to append habit tasks", error);
     }
@@ -517,6 +731,7 @@ class TimeListPlugin extends Plugin {
       completionMode: "",
       pomodoros: [],
       note: "",
+      summary: "",
     }));
 
     this.state.tasks.unshift(...tasks);
@@ -524,8 +739,7 @@ class TimeListPlugin extends Plugin {
     this.render();
 
     try {
-      const markdown = tasks.map((task) => `* [ ] ${escapeMarkdown(task.title)} #日记任务计时#`).join("\n") + "\n";
-      await this.appendDailyNote(markdown);
+      await this.writeTasksToDailyNote(tasks);
       showMessage(this.canWriteDailyNote() ? `已创建 ${tasks.length} 个任务，并写入今日日记` : `已创建 ${tasks.length} 个任务`);
     } catch (error) {
       showMessage(`任务已保存，但写入日记失败：${error.message}`, 5000, "error");
@@ -610,12 +824,16 @@ class TimeListPlugin extends Plugin {
     task.completedAt = new Date().toISOString();
     task.abandonedAt = "";
     task.note = this.buildCompletionNote(mode, payload, minutes);
+    task.summary = String(payload?.summary || "").trim();
 
     await this.saveState();
     this.render();
 
     try {
-      await this.appendDailyNote(`* [x] ${escapeMarkdown(task.title)} ✅ 用时 ${formatMinutes(minutes)}${task.note ? `，${escapeMarkdown(task.note)}` : ""}\n`);
+      const changed = await this.writeTaskToDailyNote(task, "completed", { minutes, summary: task.summary });
+      if (changed) {
+        await this.saveState();
+      }
       showMessage("任务完成，时间也被好好收进篮子里了。");
     } catch (error) {
       showMessage(`任务已完成，但写入日记失败：${error.message}`, 5000, "error");
@@ -667,6 +885,10 @@ class TimeListPlugin extends Plugin {
           <div class="time-list-dialog-hint">${pomodoroMinutes ? "将把番茄总和作为任务用时。" : "这个任务还没有番茄记录。"}</div>
         </div>
 
+        <label class="time-list-field">
+          <span>任务总结（可选）</span>
+          <textarea id="time-list-complete-summary" class="b3-text-field time-list-summary-textarea" placeholder="简单写一下完成情况"></textarea>
+        </label>
 
         <div class="time-list-dialog-footer">
           <button id="time-list-complete-cancel" class="b3-button b3-button--outline">取消</button>
@@ -687,14 +909,15 @@ class TimeListPlugin extends Plugin {
 
     const root = this.completeTaskDialog.element;
     const container = root.querySelector(".time-list-complete-dialog");
-    const preview = root.querySelector("#time-list-complete-preview");
     const submitButton = root.querySelector("#time-list-complete-submit");
     const cancelButton = root.querySelector("#time-list-complete-cancel");
     const minutesInput = root.querySelector("#time-list-complete-minutes");
+    const summaryInput = root.querySelector("#time-list-complete-summary");
 
     const getMode = () => container.dataset.selectedMode || "manual";
     const getPayload = () => ({
       minutes: minutesInput?.value || "",
+      summary: summaryInput?.value || "",
     });
     const updatePreview = () => {
       const mode = getMode();
@@ -762,7 +985,16 @@ class TimeListPlugin extends Plugin {
     task.actualMinutes = 0;
     task.completionMode = "";
     task.note = "";
+    task.summary = "";
     await this.saveState();
+    try {
+      const changed = await this.writeTaskToDailyNote(task, "pending");
+      if (changed) {
+        await this.saveState();
+      }
+    } catch (error) {
+      showMessage(`任务已恢复，但写入日记失败：${error.message}`, 5000, "error");
+    }
     this.render();
   }
 
@@ -784,7 +1016,10 @@ class TimeListPlugin extends Plugin {
     this.render();
 
     try {
-      await this.appendDailyNote(`* ${escapeMarkdown(task.title)} 🚫 已放弃\n`);
+      const changed = await this.writeTaskToDailyNote(task, "abandoned");
+      if (changed) {
+        await this.saveState();
+      }
       showMessage("已放弃任务");
     } catch (error) {
       showMessage(`任务已放弃，但写入日记失败：${error.message}`, 5000, "error");
@@ -794,6 +1029,10 @@ class TimeListPlugin extends Plugin {
   async deleteTask(taskId) {
     if (this.state.activePomodoro?.taskId === taskId) {
       await this.stopPomodoro(false);
+    }
+    const task = this.findTask(taskId);
+    if (task) {
+      await this.deleteDailyTaskBlock(task);
     }
     this.state.tasks = this.state.tasks.filter((task) => task.id !== taskId);
     await this.saveState();
@@ -883,6 +1122,10 @@ class TimeListPlugin extends Plugin {
     return this.state.tasks.filter((task) => task.date === date);
   }
 
+  getCalendarTasks() {
+    return this.state.tasks.filter((task) => isTaskInCalendarRange(task, this.calendarDate, this.calendarMode));
+  }
+
   render() {
     if (!this.dockElement) {
       return;
@@ -905,7 +1148,9 @@ class TimeListPlugin extends Plugin {
         ${
           this.currentDockView === "summary"
             ? this.renderSummaryView(todayTasks, completedTasks, abandonedTasks)
-            : this.renderTasksView(todayTasks, pendingTasks, completedTasks, abandonedTasks)
+            : this.currentDockView === "calendar"
+              ? this.renderCalendarView()
+              : this.renderTasksView(todayTasks, pendingTasks, completedTasks, abandonedTasks)
         }
       </div>
     `;
@@ -931,6 +1176,7 @@ class TimeListPlugin extends Plugin {
       <div class="time-list-tabs">
         <button class="${this.currentDockView === "tasks" ? "is-active" : ""}" data-action="switch-view" data-view="tasks">${icon("iconTlList")}<span>任务</span></button>
         <button class="${this.currentDockView === "summary" ? "is-active" : ""}" data-action="switch-view" data-view="summary">${icon("iconTlPie")}<span>总结</span></button>
+        <button class="${this.currentDockView === "calendar" ? "is-active" : ""}" data-action="switch-view" data-view="calendar">${icon("iconTlCalendar")}<span>日历</span></button>
       </div>
     `;
   }
@@ -948,6 +1194,34 @@ class TimeListPlugin extends Plugin {
     return `
       <div class="time-list-scroll">
         ${this.renderChart(todayTasks, completedTasks, abandonedTasks)}
+      </div>
+    `;
+  }
+
+  renderCalendarView() {
+    const tasks = this.getCalendarTasks();
+    const completedTasks = tasks.filter((task) => normalizeTaskStatus(task) === "completed");
+    const total = completedTasks.reduce((sum, task) => sum + (task.actualMinutes || 0), 0);
+
+    return `
+      <div class="time-list-calendar">
+        <div class="time-list-calendar-nav">
+          ${iconButton("iconTlChevronLeft", "calendar-prev", "上一个")}
+          <strong>${escapeHtml(formatCalendarTitle(this.calendarDate, this.calendarMode))}</strong>
+          ${iconButton("iconTlChevronRight", "calendar-next", "下一个")}
+        </div>
+        <div class="time-list-calendar-modes">
+          ${["day", "week", "month", "year"].map((mode) => `
+            <button class="${this.calendarMode === mode ? "is-active" : ""}" data-action="calendar-mode" data-mode="${mode}">${calendarModeLabel(mode)}</button>
+          `).join("")}
+        </div>
+        <div class="time-list-metrics time-list-metrics--two">
+          <div><span>任务数</span><strong>${tasks.length}</strong></div>
+          <div><span>完成用时</span><strong>${formatMinutes(total)}</strong></div>
+        </div>
+      </div>
+      <div class="time-list-scroll">
+        ${this.renderCalendarTaskGroups(tasks)}
       </div>
     `;
   }
@@ -1032,17 +1306,33 @@ class TimeListPlugin extends Plugin {
   }
 
   renderTaskList(title, tasks) {
-    const items = tasks
+    const sortedTasks = sortTasksForDisplay(tasks);
+    const items = sortedTasks
       .map((task) => this.renderTaskItem(task))
       .join("");
     return `
       <div>
-        <div class="time-list-section-title">${title} · ${tasks.length}</div>
+        <div class="time-list-section-title">${title} · ${sortedTasks.length}</div>
         <div class="time-list-items">
           ${items || `<div class="time-list-empty">今天还没有任务。点“新建今日任务”开始。</div>`}
         </div>
       </div>
     `;
+  }
+
+  renderCalendarTaskGroups(tasks) {
+    if (tasks.length === 0) {
+      return `<div class="time-list-empty">这个范围里还没有任务。</div>`;
+    }
+    const groups = groupTasksByDate(tasks);
+    return groups.map(([date, dateTasks]) => `
+      <div>
+        <div class="time-list-section-title">${date} · ${dateTasks.length}</div>
+        <div class="time-list-items">
+          ${sortTasksForDisplay(dateTasks).map((task) => this.renderTaskItem(task)).join("")}
+        </div>
+      </div>
+    `).join("");
   }
 
   renderTaskItem(task) {
@@ -1054,11 +1344,12 @@ class TimeListPlugin extends Plugin {
     return `
       <div class="time-list-item time-list-item--${status}" data-task-id="${task.id}">
         <div class="time-list-item-head">
-          <strong>${task.source === "habit" ? "习惯" : status === "completed" ? "今天" : "全天"}</strong>
+          <strong>${escapeHtml(taskScopeLabel(task, status))}</strong>
           <span>${icon("iconTlClock")}${timeText}</span>
           <em>${taskStatusLabel(status)}</em>
         </div>
         <div class="time-list-item-name">${escapeHtml(task.title)}</div>
+        ${task.summary ? `<div class="time-list-item-summary">${escapeHtml(task.summary)}</div>` : ""}
         ${
           status === "completed"
             ? this.renderCompletedActions(task)
@@ -1107,6 +1398,7 @@ class TimeListPlugin extends Plugin {
     root.querySelector("[data-action='open-setting']")?.addEventListener("click", () => this.openSetting());
     root.querySelector("[data-action='open-create-task']")?.addEventListener("click", () => this.openCreateTaskDialog());
     root.querySelector("[data-action='refresh']")?.addEventListener("click", async () => {
+      await this.syncTodayFromDailyNote({ silent: true });
       await this.importHabitsForToday({ silent: false });
       this.render();
     });
@@ -1122,6 +1414,15 @@ class TimeListPlugin extends Plugin {
           this.openCompleteTaskDialog(taskId);
         } else if (action === "switch-view") {
           this.currentDockView = button.dataset.view || "tasks";
+          this.render();
+        } else if (action === "calendar-mode") {
+          this.calendarMode = button.dataset.mode || "day";
+          this.render();
+        } else if (action === "calendar-prev") {
+          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, -1);
+          this.render();
+        } else if (action === "calendar-next") {
+          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
           this.render();
         } else if (action === "start-pomodoro") {
           await this.startPomodoro(taskId);
@@ -1226,14 +1527,270 @@ function cleanTaskLine(line) {
     .replace(/^\d+[.)、]\s+/, "")
     .replace(/^\[[ xX]\]\s+/, "")
     .replace(/^【.*?】\s*/, "")
+    .replace(/\s*📅\s*\d{4}-\d{2}-\d{2}\s*/g, " ")
+    .replace(/\s*(✅|✔️|☑️|🚫|❌)\s*/g, " ")
+    .replace(/\s*⏱\s*\S+\s*/g, " ")
+    .replace(/\s*用时\s*\S+\s*/g, " ")
+    .replace(/\s*📝.*$/g, "")
     .replace(/\s*#\S+#?\s*$/g, "")
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
     .replace(/[`*_~]/g, "")
+    .replace(/\s+/g, " ")
     .trim();
+}
+
+function formatDailyTaskRecords(tasks) {
+  return tasks.map((task) => formatDailyTaskLine(task)).join("\n\n") + "\n";
+}
+
+function formatDailyTaskRecord(task, status = normalizeTaskStatus(task), options = {}) {
+  const summary = String(options.summary ?? task.summary ?? "").trim();
+  const summaryText = summary ? ` 📝${escapeMarkdown(summary).replace(/\s+/g, " ")}` : "";
+  return `${formatDailyTaskLine(task, status, options)}${summaryText}\n`;
+}
+
+function formatDailyTaskLine(task, status = normalizeTaskStatus(task), options = {}) {
+  const date = task.date || todayKey();
+  const parts = [escapeMarkdown(task.title), `📅${date}`];
+  if (status === "completed") {
+    const minutes = Number(options.minutes ?? task.actualMinutes) || 0;
+    parts.push("✅");
+    if (minutes > 0) {
+      parts.push(`⏱${formatCompactMinutes(minutes)}`);
+    }
+  } else if (status === "abandoned") {
+    parts.push("🚫");
+  }
+  return parts.join(" ");
 }
 
 function normalizeTitleKey(title) {
   return cleanTaskLine(title).replace(/\s+/g, "").toLowerCase();
+}
+
+function parseDailyTaskRecordsFromRows(rows) {
+  const records = [];
+  rows.forEach((row) => {
+    const markdown = String(row.markdown || row.content || "");
+    const parsedLines = markdown
+      .split(/\n+/)
+      .map((line) => parseDailyTaskRecord(line, row))
+      .filter(Boolean);
+    parsedLines.forEach((record) => {
+      records.push({
+        ...record,
+        blockId: parsedLines.length === 1 ? row.id : "",
+        createdAt: row.created ? siyuanTimeToIso(row.created) : "",
+      });
+    });
+  });
+  return records;
+}
+
+function parseDailyTaskRecord(line, row = {}) {
+  const text = String(line || "").trim();
+  const dateMatch = /📅\s*(\d{4}-\d{2}-\d{2})/.exec(text);
+  if (!dateMatch) {
+    return null;
+  }
+  const title = cleanTaskLine(text.slice(0, dateMatch.index));
+  if (!title || isMetadataLine(title)) {
+    return null;
+  }
+  const status = /✅|✔️|☑️/.test(text) ? "completed" : /🚫|❌/.test(text) ? "abandoned" : "pending";
+  const summaryMatch = /📝\s*(.+)$/.exec(text);
+  const actualMinutes = status === "completed" ? parseTaskMinutes(text) : 0;
+  return {
+    title,
+    date: dateMatch[1],
+    status,
+    blockId: row.id || "",
+    actualMinutes,
+    summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
+  };
+}
+
+function parseTaskMinutes(text) {
+  const compactMatch = /⏱\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?/i.exec(text);
+  if (compactMatch && (compactMatch[1] || compactMatch[2])) {
+    return (Number(compactMatch[1]) || 0) * 60 + (Number(compactMatch[2]) || 0);
+  }
+  const minuteMatch = /用时\s*(\d+)\s*(?:分钟|m)?/i.exec(text);
+  if (minuteMatch) {
+    return Number(minuteMatch[1]) || 0;
+  }
+  return 0;
+}
+
+function shouldSyncFromWsEvent(event, tasks) {
+  const detail = event?.detail;
+  if (!detail) {
+    return false;
+  }
+  const haystack = safeStringify(detail);
+  if (!haystack) {
+    return false;
+  }
+  if (haystack.includes(`📅${todayKey()}`)) {
+    return true;
+  }
+  return tasks
+    .filter((task) => task.date === todayKey() && task.blockId)
+    .some((task) => haystack.includes(task.blockId));
+}
+
+function safeStringify(value) {
+  const seen = new WeakSet();
+  try {
+    return JSON.stringify(value, (key, item) => {
+      if (typeof item === "function") {
+        return undefined;
+      }
+      if (typeof Element !== "undefined" && item instanceof Element) {
+        return {
+          id: item.getAttribute("data-node-id") || item.id || "",
+          text: item.textContent || "",
+        };
+      }
+      if (item && typeof item === "object") {
+        if (seen.has(item)) {
+          return undefined;
+        }
+        seen.add(item);
+      }
+      return item;
+    });
+  } catch (error) {
+    console.warn("[siyuan-time-list] failed to stringify ws event", error);
+    return "";
+  }
+}
+
+function siyuanTimeToIso(value) {
+  const text = String(value || "");
+  const match = /^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$/.exec(text);
+  if (!match) {
+    return "";
+  }
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), Number(match[4]), Number(match[5]), Number(match[6])).toISOString();
+}
+
+function sortTasksForDisplay(tasks) {
+  const statusOrder = {
+    pending: 0,
+    abandoned: 1,
+    completed: 2,
+  };
+  return tasks
+    .map((task, index) => ({ task, index }))
+    .sort((left, right) => {
+      const leftStatus = normalizeTaskStatus(left.task);
+      const rightStatus = normalizeTaskStatus(right.task);
+      const statusDiff = statusOrder[leftStatus] - statusOrder[rightStatus];
+      if (statusDiff !== 0) {
+        return statusDiff;
+      }
+      const leftTime = Date.parse(left.task.createdAt || left.task.completedAt || "") || 0;
+      const rightTime = Date.parse(right.task.createdAt || right.task.completedAt || "") || 0;
+      return rightTime - leftTime || left.index - right.index;
+    })
+    .map((item) => item.task);
+}
+
+function groupTasksByDate(tasks) {
+  const map = new Map();
+  tasks.forEach((task) => {
+    const date = task.date || todayKey();
+    if (!map.has(date)) {
+      map.set(date, []);
+    }
+    map.get(date).push(task);
+  });
+  return [...map.entries()].sort(([leftDate], [rightDate]) => rightDate.localeCompare(leftDate));
+}
+
+function isTaskInCalendarRange(task, selectedDate, mode) {
+  const date = task.date || "";
+  if (mode === "year") {
+    return date.slice(0, 4) === selectedDate.slice(0, 4);
+  }
+  if (mode === "month") {
+    return date.slice(0, 7) === selectedDate.slice(0, 7);
+  }
+  if (mode === "week") {
+    const taskTime = parseDateKey(date).getTime();
+    const [start, end] = getWeekRange(selectedDate);
+    return taskTime >= start.getTime() && taskTime <= end.getTime();
+  }
+  return date === selectedDate;
+}
+
+function shiftCalendarDate(dateKey, mode, direction) {
+  const date = parseDateKey(dateKey);
+  if (mode === "year") {
+    date.setFullYear(date.getFullYear() + direction);
+  } else if (mode === "month") {
+    date.setMonth(date.getMonth() + direction);
+  } else if (mode === "week") {
+    date.setDate(date.getDate() + direction * 7);
+  } else {
+    date.setDate(date.getDate() + direction);
+  }
+  return formatDateKey(date);
+}
+
+function parseDateKey(dateKey) {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateKey || ""));
+  if (!match) {
+    return new Date();
+  }
+  return new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+}
+
+function formatDateKey(date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function formatCalendarTitle(dateKey, mode) {
+  if (mode === "year") {
+    return dateKey.slice(0, 4);
+  }
+  if (mode === "month") {
+    return dateKey.slice(0, 7);
+  }
+  if (mode === "week") {
+    const [start, end] = getWeekRange(dateKey);
+    return `${formatDateKey(start)} ~ ${formatDateKey(end)}`;
+  }
+  return dateKey;
+}
+
+function calendarModeLabel(mode) {
+  if (mode === "year") {
+    return "年";
+  }
+  if (mode === "month") {
+    return "月";
+  }
+  if (mode === "week") {
+    return "周";
+  }
+  return "日";
+}
+
+function getWeekRange(dateKey) {
+  const date = parseDateKey(dateKey);
+  const day = date.getDay() || 7;
+  const start = new Date(date);
+  start.setDate(date.getDate() - day + 1);
+  start.setHours(0, 0, 0, 0);
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  end.setHours(23, 59, 59, 999);
+  return [start, end];
 }
 
 function normalizeTaskStatus(task) {
@@ -1251,6 +1808,19 @@ function taskStatusLabel(status) {
     return "已放弃";
   }
   return "待完成";
+}
+
+function taskScopeLabel(task, status) {
+  if (task.source === "habit") {
+    return "习惯";
+  }
+  if (task.date && task.date !== todayKey()) {
+    return task.date.slice(5);
+  }
+  if (status === "completed") {
+    return "今天";
+  }
+  return "全天";
 }
 
 function clampNumber(value, min, max, fallback) {
@@ -1390,8 +1960,40 @@ function escapeMarkdown(value) {
   return String(value).replace(/([\\`*_{}\[\]()#+\-.!|>])/g, "\\$1");
 }
 
+function unescapeMarkdown(value) {
+  return String(value).replace(/\\([\\`*_{}\[\]()#+\-.!|>])/g, "$1");
+}
+
 function escapeAttr(value) {
   return escapeHtml(value);
+}
+
+function escapeSql(value) {
+  return String(value).replace(/'/g, "''");
+}
+
+function extractBlockId(result) {
+  if (!result) {
+    return "";
+  }
+  if (typeof result === "string") {
+    return result;
+  }
+  if (result.id) {
+    return result.id;
+  }
+  if (result.blockId) {
+    return result.blockId;
+  }
+  if (Array.isArray(result)) {
+    return extractBlockId(result[0]);
+  }
+  const operations = [
+    ...(Array.isArray(result.doOperations) ? result.doOperations : []),
+    ...(Array.isArray(result.transactions) ? result.transactions.flatMap((item) => item.doOperations || []) : []),
+  ];
+  const operation = operations.find((item) => item?.id || item?.blockID);
+  return operation?.id || operation?.blockID || "";
 }
 
 module.exports = TimeListPlugin;
