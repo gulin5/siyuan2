@@ -60,6 +60,7 @@ class TimeListPlugin extends Plugin {
     this.settingDialog = null;
     this.createTaskDialog = null;
     this.completeTaskDialog = null;
+    this.calendarDialog = null;
     this.currentDockView = "tasks";
     this.calendarMode = "week";
     this.calendarDate = todayKey();
@@ -114,6 +115,10 @@ class TimeListPlugin extends Plugin {
     if (this.completeTaskDialog) {
       this.completeTaskDialog.destroy();
       this.completeTaskDialog = null;
+    }
+    if (this.calendarDialog) {
+      this.calendarDialog.destroy();
+      this.calendarDialog = null;
     }
   }
 
@@ -393,6 +398,9 @@ class TimeListPlugin extends Plugin {
     this.autoSyncTimer = window.setTimeout(async () => {
       this.autoSyncTimer = null;
       await this.syncTodayFromDailyNote({ silent: true });
+      if (this.calendarDialog) {
+        this.refreshCalendarDialog();
+      }
       if (this.dockElement) {
         this.render();
       }
@@ -1131,6 +1139,9 @@ class TimeListPlugin extends Plugin {
     if (!this.dockElement) {
       return;
     }
+    if (!["tasks", "summary"].includes(this.currentDockView)) {
+      this.currentDockView = "tasks";
+    }
 
     const beforeCleanup = this.state.tasks.length;
     this.state.tasks = this.state.tasks.filter((task) => !(task.date === todayKey() && isMetadataLine(task.title)));
@@ -1149,9 +1160,7 @@ class TimeListPlugin extends Plugin {
         ${
           this.currentDockView === "summary"
             ? this.renderSummaryView(todayTasks, completedTasks, abandonedTasks)
-            : this.currentDockView === "calendar"
-              ? this.renderCalendarView()
-              : this.renderTasksView(todayTasks, pendingTasks, completedTasks, abandonedTasks)
+            : this.renderTasksView(todayTasks, pendingTasks, completedTasks, abandonedTasks)
         }
       </div>
     `;
@@ -1165,6 +1174,7 @@ class TimeListPlugin extends Plugin {
           <strong>${todayKey()}</strong>
         </div>
         <div class="time-list-icon-group">
+          ${iconButton("iconTlCalendar", "open-calendar", "日历")}
           ${iconButton("iconTlSettings", "open-setting", "设置")}
           ${iconButton("iconTlRefresh", "refresh", "刷新")}
         </div>
@@ -1177,9 +1187,41 @@ class TimeListPlugin extends Plugin {
       <div class="time-list-tabs">
         <button class="${this.currentDockView === "tasks" ? "is-active" : ""}" data-action="switch-view" data-view="tasks">${icon("iconTlList")}<span>任务</span></button>
         <button class="${this.currentDockView === "summary" ? "is-active" : ""}" data-action="switch-view" data-view="summary">${icon("iconTlPie")}<span>总结</span></button>
-        <button class="${this.currentDockView === "calendar" ? "is-active" : ""}" data-action="switch-view" data-view="calendar">${icon("iconTlCalendar")}<span>日历</span></button>
       </div>
     `;
+  }
+
+  openCalendarDialog() {
+    if (this.calendarDialog) {
+      this.calendarDialog.destroy();
+      this.calendarDialog = null;
+    }
+
+    this.calendarMode = this.calendarMode || "week";
+    if (this.calendarMode === "week") {
+      this.calendarDate = todayKey();
+    }
+
+    this.calendarDialog = new Dialog({
+      title: "任务日历",
+      content: `<div class="time-list-calendar-dialog">${this.renderCalendarView()}</div>`,
+      width: this.isMobile ? "100vw" : "96vw",
+      height: this.isMobile ? "100vh" : "92vh",
+      destroyCallback: () => {
+        this.calendarDialog = null;
+      },
+    });
+
+    this.bindCalendarEvents(this.calendarDialog.element.querySelector(".time-list-calendar-dialog"));
+  }
+
+  refreshCalendarDialog() {
+    const root = this.calendarDialog?.element?.querySelector(".time-list-calendar-dialog");
+    if (!root) {
+      return;
+    }
+    root.innerHTML = this.renderCalendarView();
+    this.bindCalendarEvents(root);
   }
 
   renderTasksView(todayTasks, pendingTasks, completedTasks, abandonedTasks) {
@@ -1463,6 +1505,7 @@ class TimeListPlugin extends Plugin {
       return;
     }
 
+    root.querySelector("[data-action='open-calendar']")?.addEventListener("click", () => this.openCalendarDialog());
     root.querySelector("[data-action='open-setting']")?.addEventListener("click", () => this.openSetting());
     root.querySelector("[data-action='open-create-task']")?.addEventListener("click", () => this.openCreateTaskDialog());
     root.querySelector("[data-action='refresh']")?.addEventListener("click", async () => {
@@ -1472,7 +1515,7 @@ class TimeListPlugin extends Plugin {
     });
     root.querySelectorAll("[data-action]").forEach((button) => {
       const action = button.dataset.action;
-      if (["open-setting", "open-create-task", "refresh"].includes(action)) {
+      if (["open-calendar", "open-setting", "open-create-task", "refresh"].includes(action)) {
         return;
       }
       button.addEventListener("click", async () => {
@@ -1481,26 +1524,6 @@ class TimeListPlugin extends Plugin {
           this.openCompleteTaskDialog(taskId);
         } else if (action === "switch-view") {
           this.currentDockView = button.dataset.view || "tasks";
-          this.render();
-        } else if (action === "calendar-mode") {
-          this.calendarMode = button.dataset.mode || "week";
-          if (this.calendarMode === "week") {
-            this.calendarDate = todayKey();
-          }
-          this.render();
-        } else if (action === "calendar-prev") {
-          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, -1);
-          this.render();
-        } else if (action === "calendar-next") {
-          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
-          this.render();
-        } else if (action === "calendar-refresh") {
-          await this.syncTodayFromDailyNote({ silent: true });
-          await this.importHabitsForToday({ silent: false });
-          this.render();
-        } else if (action === "calendar-jump-month") {
-          this.calendarDate = button.dataset.date || this.calendarDate;
-          this.calendarMode = "month";
           this.render();
         } else if (action === "start-pomodoro") {
           await this.startPomodoro(taskId);
@@ -1518,6 +1541,40 @@ class TimeListPlugin extends Plugin {
           await this.abandonTask(taskId);
         } else if (action === "delete-task") {
           await this.deleteTask(taskId);
+        }
+      });
+    });
+  }
+
+  bindCalendarEvents(root) {
+    if (!root) {
+      return;
+    }
+
+    root.querySelectorAll("[data-action]").forEach((button) => {
+      const action = button.dataset.action;
+      button.addEventListener("click", async () => {
+        if (action === "calendar-mode") {
+          this.calendarMode = button.dataset.mode || "week";
+          if (this.calendarMode === "week") {
+            this.calendarDate = todayKey();
+          }
+          this.refreshCalendarDialog();
+        } else if (action === "calendar-prev") {
+          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, -1);
+          this.refreshCalendarDialog();
+        } else if (action === "calendar-next") {
+          this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
+          this.refreshCalendarDialog();
+        } else if (action === "calendar-refresh") {
+          await this.syncTodayFromDailyNote({ silent: true });
+          await this.importHabitsForToday({ silent: false });
+          this.refreshCalendarDialog();
+          this.render();
+        } else if (action === "calendar-jump-month") {
+          this.calendarDate = button.dataset.date || this.calendarDate;
+          this.calendarMode = "month";
+          this.refreshCalendarDialog();
         }
       });
     });

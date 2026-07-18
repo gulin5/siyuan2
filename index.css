@@ -80,7 +80,7 @@
 
 .time-list-tabs {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   padding: 3px;
   border-radius: 12px;
@@ -330,6 +330,26 @@
 .time-list-calendar {
   display: grid;
   gap: 7px;
+}
+
+.time-list-calendar-dialog {
+  --time-list-soft-surface: color-mix(in srgb, var(--b3-theme-surface) 56%, transparent);
+  --time-list-softer-surface: color-mix(in srgb, var(--b3-theme-surface) 34%, transparent);
+  --time-list-soft-border: color-mix(in srgb, var(--b3-theme-on-background) 12%, transparent);
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: 12px;
+  color: var(--b3-theme-on-background);
+  background: transparent;
+}
+
+.time-list-calendar-dialog .time-list-calendar-stage {
+  flex: 1;
 }
 
 .time-list-calendar-toolbar {
