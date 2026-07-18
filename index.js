@@ -224,7 +224,7 @@ class TimeListPlugin extends Plugin {
     const content = `
       <div style="padding: 16px; display: flex; flex-direction: column; gap: 14px;">
         <div style="font-size: 14px; color: var(--b3-theme-on-surface); line-height: 1.6;">
-          配置任务写入哪个笔记本的今日日记。番茄钟为正向计时，不需要预设时长。
+          配置任务写入哪个笔记本的今日日记。
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 4px;">
@@ -542,7 +542,7 @@ class TimeListPlugin extends Plugin {
       <div class="time-list-dialog">
         <label class="time-list-field">
           <span>今日任务</span>
-          <textarea id="time-list-create-titles" class="b3-text-field time-list-textarea" placeholder="一行一个任务，例如：&#10;整理插件 UI&#10;写完日记任务逻辑&#10;复盘今天的时间"></textarea>
+          <textarea id="time-list-create-titles" class="b3-text-field time-list-textarea" placeholder="支持多任务创建&#10;使用换行分隔"></textarea>
         </label>
 
         <div class="time-list-dialog-footer">
