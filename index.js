@@ -19,11 +19,26 @@ const ICONS = `
     <path d="M17.25 9.5h-2.5v7.4l5.65 3.4 1.3-2.1-4.45-2.65V9.5Z"/>
     <path d="M8.2 15.2h3.2v2.2H8.2v-2.2Zm12.4-5.3h3.2v2.2h-3.2V9.9Zm0 10h3.2v2.2h-3.2v-2.2Z"/>
   </symbol>
+  <symbol id="iconTlPlus" viewBox="0 0 24 24"><path d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6V5Z"/></symbol>
+  <symbol id="iconTlList" viewBox="0 0 24 24"><path d="M5 6.5h2v2H5v-2Zm4 .25h10v1.5H9v-1.5ZM5 11h2v2H5v-2Zm4 .25h10v1.5H9v-1.5ZM5 15.5h2v2H5v-2Zm4 .25h10v1.5H9v-1.5Z"/></symbol>
+  <symbol id="iconTlPie" viewBox="0 0 24 24"><path d="M11 3a9 9 0 1 0 9 9h-9V3Zm2 0v7h7a9 9 0 0 0-7-7Z"/></symbol>
+  <symbol id="iconTlCheck" viewBox="0 0 24 24"><path d="M19.7 6.3 9 17l-4.7-4.7 1.4-1.4L9 14.2l9.3-9.3 1.4 1.4Z"/></symbol>
+  <symbol id="iconTlClock" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10h-2a8 8 0 1 1-8-8V2Zm1 5h-2v6l5 3 .95-1.65L13 12V7Z"/></symbol>
+  <symbol id="iconTlPause" viewBox="0 0 24 24"><path d="M7 5h3v14H7V5Zm7 0h3v14h-3V5Z"/></symbol>
+  <symbol id="iconTlPlay" viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z"/></symbol>
+  <symbol id="iconTlStop" viewBox="0 0 24 24"><path d="M6 6h12v12H6V6Z"/></symbol>
+  <symbol id="iconTlClose" viewBox="0 0 24 24"><path d="m6.4 5 12.6 12.6-1.4 1.4L5 6.4 6.4 5Zm11.2 0L19 6.4 6.4 19 5 17.6 17.6 5Z"/></symbol>
+  <symbol id="iconTlUndo" viewBox="0 0 24 24"><path d="M8 7V4L3 9l5 5v-3h6a4 4 0 1 1 0 8H9v-2h5a2 2 0 1 0 0-4H8Z"/></symbol>
+  <symbol id="iconTlTrash" viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-2 6h10l-.8 11H7.8L7 9Z"/></symbol>
+  <symbol id="iconTlSettings" viewBox="0 0 24 24"><path d="M19.4 13.5a7.8 7.8 0 0 0 0-3l2-1.5-2-3.5-2.4 1a8 8 0 0 0-2.6-1.5L14 2h-4l-.4 3a8 8 0 0 0-2.6 1.5l-2.4-1-2 3.5 2 1.5a7.8 7.8 0 0 0 0 3l-2 1.5 2 3.5 2.4-1a8 8 0 0 0 2.6 1.5l.4 3h4l.4-3a8 8 0 0 0 2.6-1.5l2.4 1 2-3.5-2-1.5ZM12 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z"/></symbol>
+  <symbol id="iconTlRefresh" viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></symbol>
 `;
 
 const defaultSettings = {
   notebookId: "",
   autoAppendToDailyNote: true,
+  habitDocId: "",
+  autoImportHabits: true,
 };
 
 const defaultState = {
@@ -61,6 +76,7 @@ class TimeListPlugin extends Plugin {
       await this.loadAllData();
       this.registerDock();
       await this.setupSettings();
+      await this.importHabitsForToday({ silent: true });
       this.startTicker();
       showMessage("日记任务计时插件已加载");
     } catch (error) {
@@ -141,11 +157,23 @@ class TimeListPlugin extends Plugin {
     appendToggle.type = "checkbox";
     appendToggle.checked = this.settings.autoAppendToDailyNote;
 
+    const habitDocInput = document.createElement("input");
+    habitDocInput.className = "b3-text-field fn__flex-center fn__size200";
+    habitDocInput.placeholder = "习惯文档 ID";
+    habitDocInput.value = this.settings.habitDocId || "";
+
+    const habitToggle = document.createElement("input");
+    habitToggle.type = "checkbox";
+    habitToggle.checked = this.settings.autoImportHabits;
+
     this.setting = new Setting({
       confirmCallback: async () => {
         this.settings.notebookId = notebookSelect.value;
         this.settings.autoAppendToDailyNote = appendToggle.checked;
+        this.settings.habitDocId = habitDocInput.value.trim();
+        this.settings.autoImportHabits = habitToggle.checked;
         await this.saveSettings();
+        await this.importHabitsForToday({ silent: false });
         this.render();
         showMessage("日记任务计时设置已保存");
       },
@@ -161,6 +189,18 @@ class TimeListPlugin extends Plugin {
       title: "写入今日日记",
       description: "创建任务和完成任务时向日记追加一条记录。",
       createActionElement: () => appendToggle,
+    });
+
+    this.setting.addItem({
+      title: "习惯文档 ID",
+      description: "每天自动读取这个文档里的每一行，创建为今日习惯任务。",
+      createActionElement: () => habitDocInput,
+    });
+
+    this.setting.addItem({
+      title: "自动导入习惯",
+      description: "插件加载或刷新时，为今天补齐习惯任务。",
+      createActionElement: () => habitToggle,
     });
   }
 
@@ -202,6 +242,16 @@ class TimeListPlugin extends Plugin {
           创建和完成任务时写入今日日记
         </label>
 
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <label style="font-size: 13px; font-weight: 500; color: var(--b3-theme-on-surface);">习惯文档 ID</label>
+          <input id="time-list-habit-doc-id" class="b3-text-field" placeholder="粘贴习惯文档 ID" value="${escapeAttr(this.settings.habitDocId || "")}" style="width: 100%;" />
+        </div>
+
+        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--b3-theme-on-surface);">
+          <input id="time-list-auto-habits" type="checkbox" ${this.settings.autoImportHabits ? "checked" : ""} />
+          每天自动导入习惯任务
+        </label>
+
         <div id="time-list-setting-status" style="font-size: 13px; color: var(--b3-theme-on-surface-light);"></div>
 
         <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; border-top: 1px solid var(--b3-theme-surface-light); padding-top: 14px;">
@@ -224,6 +274,8 @@ class TimeListPlugin extends Plugin {
     const root = this.settingDialog.element;
     const notebookSelect = root.querySelector("#time-list-notebook");
     const appendToggle = root.querySelector("#time-list-auto-append");
+    const habitDocInput = root.querySelector("#time-list-habit-doc-id");
+    const habitToggle = root.querySelector("#time-list-auto-habits");
     const statusElement = root.querySelector("#time-list-setting-status");
     const cancelButton = root.querySelector("#time-list-cancel-settings");
     const saveButton = root.querySelector("#time-list-save-settings");
@@ -240,8 +292,11 @@ class TimeListPlugin extends Plugin {
         ...this.settings,
         notebookId: notebookSelect.value,
         autoAppendToDailyNote: appendToggle.checked,
+        habitDocId: habitDocInput.value.trim(),
+        autoImportHabits: habitToggle.checked,
       };
       await this.saveSettings();
+      await this.importHabitsForToday({ silent: false });
       this.render();
       showMessage("日记任务计时设置已保存 ✅");
       this.settingDialog?.destroy();
@@ -265,6 +320,7 @@ class TimeListPlugin extends Plugin {
         this.element.style.height = "100%";
         plugin.dockElement = this.element;
         plugin.render();
+        plugin.importHabitsForToday({ silent: true }).then(() => plugin.render());
       },
       destroy() {
         if (plugin.dockElement === this.element) {
@@ -356,6 +412,92 @@ class TimeListPlugin extends Plugin {
     return Boolean(this.settings.autoAppendToDailyNote && this.settings.notebookId);
   }
 
+  async getDocumentMarkdown(documentId) {
+    const data = await this.request("/api/export/exportMdContent", { id: documentId });
+    return String(data?.content || data || "");
+  }
+
+  async importHabitsForToday({ silent = true } = {}) {
+    if (!this.settings.autoImportHabits || !this.settings.habitDocId) {
+      return 0;
+    }
+
+    let markdown = "";
+    try {
+      markdown = await this.getDocumentMarkdown(this.settings.habitDocId);
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to read habit document", error);
+      if (!silent) {
+        showMessage(`读取习惯文档失败：${error.message}`, 5000, "error");
+      }
+      return 0;
+    }
+
+    const titles = parseHabitTitles(markdown);
+    await this.cleanupInvalidHabitTasksForToday();
+    if (titles.length === 0) {
+      if (!silent) {
+        showMessage("习惯文档里没有可导入的行。", 3000, "error");
+      }
+      return 0;
+    }
+
+    const date = todayKey();
+    const existingKeys = new Set(this.state.tasks
+      .filter((task) => task.date === date)
+      .map((task) => normalizeTitleKey(task.title)));
+    const nextTitles = titles.filter((title) => !existingKeys.has(normalizeTitleKey(title)));
+    if (nextTitles.length === 0) {
+      if (!silent) {
+        showMessage("今天的习惯任务已经创建过了");
+      }
+      return 0;
+    }
+
+    const now = new Date().toISOString();
+    const tasks = nextTitles.map((title) => ({
+      id: createId(),
+      title,
+      date,
+      status: "pending",
+      source: "habit",
+      sourceDocId: this.settings.habitDocId,
+      sourceKey: normalizeTitleKey(title),
+      createdAt: now,
+      completedAt: "",
+      actualMinutes: 0,
+      completionMode: "",
+      pomodoros: [],
+      note: "",
+    }));
+
+    this.state.tasks.unshift(...tasks);
+    await this.saveState();
+
+    try {
+      const markdown = tasks.map((task) => `* [ ] ${escapeMarkdown(task.title)} #习惯任务#`).join("\n") + "\n";
+      await this.appendDailyNote(markdown);
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to append habit tasks", error);
+    }
+
+    if (!silent) {
+      showMessage(`已导入 ${tasks.length} 个习惯任务`);
+    }
+    return tasks.length;
+  }
+
+  async cleanupInvalidHabitTasksForToday() {
+    const date = todayKey();
+    const before = this.state.tasks.length;
+    this.state.tasks = this.state.tasks.filter((task) => {
+      return !(task.date === date && isMetadataLine(task.title));
+    });
+    if (this.state.tasks.length !== before) {
+      await this.saveState();
+    }
+  }
+
   async addTasks(rawText) {
     const titles = parseTaskTitles(rawText);
     if (titles.length === 0) {
@@ -402,10 +544,6 @@ class TimeListPlugin extends Plugin {
           <span>今日任务</span>
           <textarea id="time-list-create-titles" class="b3-text-field time-list-textarea" placeholder="一行一个任务，例如：&#10;整理插件 UI&#10;写完日记任务逻辑&#10;复盘今天的时间"></textarea>
         </label>
-
-        <div class="time-list-dialog-hint">
-          ${this.settings.notebookId ? "会同步追加到你选择的今日日记。" : "未选择日记笔记本，只保存到插件数据。"}
-        </div>
 
         <div class="time-list-dialog-footer">
           <button id="time-list-create-cancel" class="b3-button b3-button--outline">取消</button>
@@ -497,18 +635,14 @@ class TimeListPlugin extends Plugin {
 
     const pomodoroMinutes = totalPomodoroMinutes(task);
     const content = `
-      <div class="time-list-dialog time-list-complete-dialog" data-selected-mode="range">
+      <div class="time-list-dialog time-list-complete-dialog" data-selected-mode="manual">
         <div class="time-list-dialog-title">${escapeHtml(task.title)}</div>
         <div class="time-list-dialog-hint">
           番茄累计 ${formatMinutes(pomodoroMinutes)} · ${(task.pomodoros || []).length} 次专注
         </div>
 
-        <div class="time-list-choice-grid">
-          <button class="time-list-choice-card is-active" data-action="dialog-mode" data-mode="range">
-            <strong>时间段</strong>
-            <span>填写开始和结束</span>
-          </button>
-          <button class="time-list-choice-card" data-action="dialog-mode" data-mode="manual">
+        <div class="time-list-choice-grid time-list-choice-grid--two">
+          <button class="time-list-choice-card is-active" data-action="dialog-mode" data-mode="manual">
             <strong>直接填</strong>
             <span>输入总分钟数</span>
           </button>
@@ -518,18 +652,7 @@ class TimeListPlugin extends Plugin {
           </button>
         </div>
 
-        <div class="time-list-dialog-mode" data-role="dialog-mode-body" data-mode="range">
-          <label class="time-list-field">
-            <span>开始时间</span>
-            <input id="time-list-complete-start" class="b3-text-field" type="time" />
-          </label>
-          <label class="time-list-field">
-            <span>结束时间</span>
-            <input id="time-list-complete-end" class="b3-text-field" type="time" value="${currentTimeValue()}" />
-          </label>
-        </div>
-
-        <div class="time-list-dialog-mode time-list-hidden" data-role="dialog-mode-body" data-mode="manual">
+        <div class="time-list-dialog-mode" data-role="dialog-mode-body" data-mode="manual">
           <label class="time-list-field">
             <span>实际用时（分钟）</span>
             <input id="time-list-complete-minutes" class="b3-text-field" type="number" min="1" placeholder="例如：35" />
@@ -544,7 +667,6 @@ class TimeListPlugin extends Plugin {
           <div class="time-list-dialog-hint">${pomodoroMinutes ? "将把番茄总和作为任务用时。" : "这个任务还没有番茄记录。"}</div>
         </div>
 
-        <div id="time-list-complete-preview" class="time-list-dialog-hint">将记录：请填写有效时长</div>
 
         <div class="time-list-dialog-footer">
           <button id="time-list-complete-cancel" class="b3-button b3-button--outline">取消</button>
@@ -568,20 +690,15 @@ class TimeListPlugin extends Plugin {
     const preview = root.querySelector("#time-list-complete-preview");
     const submitButton = root.querySelector("#time-list-complete-submit");
     const cancelButton = root.querySelector("#time-list-complete-cancel");
-    const startInput = root.querySelector("#time-list-complete-start");
-    const endInput = root.querySelector("#time-list-complete-end");
     const minutesInput = root.querySelector("#time-list-complete-minutes");
 
-    const getMode = () => container.dataset.selectedMode || "range";
+    const getMode = () => container.dataset.selectedMode || "manual";
     const getPayload = () => ({
-      startTime: startInput?.value || "",
-      endTime: endInput?.value || "",
       minutes: minutesInput?.value || "",
     });
     const updatePreview = () => {
       const mode = getMode();
       const minutes = this.resolveCompletionMinutes(task, mode, getPayload());
-      preview.textContent = minutes > 0 ? `将记录：${formatMinutes(minutes)}` : "将记录：请填写有效时长";
       submitButton.disabled = minutes <= 0;
     };
     const setMode = (mode) => {
@@ -598,7 +715,7 @@ class TimeListPlugin extends Plugin {
     root.querySelectorAll("[data-action='dialog-mode']").forEach((button) => {
       button.addEventListener("click", () => setMode(button.dataset.mode));
     });
-    [startInput, endInput, minutesInput].forEach((input) => {
+    [minutesInput].forEach((input) => {
       input?.addEventListener("input", updatePreview);
       input?.addEventListener("change", updatePreview);
     });
@@ -611,13 +728,10 @@ class TimeListPlugin extends Plugin {
     });
 
     updatePreview();
-    setTimeout(() => startInput?.focus(), 0);
+    setTimeout(() => minutesInput?.focus(), 0);
   }
 
   resolveCompletionMinutes(task, mode, payload) {
-    if (mode === "range") {
-      return diffTimeInputs(payload.startTime, payload.endTime);
-    }
     if (mode === "manual") {
       return clampNumber(payload.minutes, 0, 24 * 60, 0);
     }
@@ -628,9 +742,6 @@ class TimeListPlugin extends Plugin {
   }
 
   buildCompletionNote(mode, payload, minutes) {
-    if (mode === "range") {
-      return `${payload.startTime}–${payload.endTime}`;
-    }
     if (mode === "manual") {
       return "手动填写";
     }
@@ -777,6 +888,11 @@ class TimeListPlugin extends Plugin {
       return;
     }
 
+    const beforeCleanup = this.state.tasks.length;
+    this.state.tasks = this.state.tasks.filter((task) => !(task.date === todayKey() && isMetadataLine(task.title)));
+    if (this.state.tasks.length !== beforeCleanup) {
+      this.saveState();
+    }
     const todayTasks = this.getTodayTasks();
     const pendingTasks = todayTasks.filter((task) => task.status === "pending" || !task.status);
     const completedTasks = todayTasks.filter((task) => task.status === "completed");
@@ -797,16 +913,14 @@ class TimeListPlugin extends Plugin {
   }
 
   renderHeader() {
-    const notebookStatus = this.settings.notebookId ? "已连接日记笔记本" : "请在设置中选择日记笔记本";
     return `
       <div class="time-list-header">
         <div class="time-list-title">
-          <strong>今天的任务</strong>
-          <span class="time-list-date">${todayKey()} · ${notebookStatus}</span>
+          <strong>${todayKey()}</strong>
         </div>
-        <div class="time-list-row">
-          <button class="time-list-button time-list-button--muted" data-action="open-setting">设置</button>
-          <button class="time-list-button time-list-button--muted" data-action="refresh">刷新</button>
+        <div class="time-list-icon-group">
+          ${iconButton("iconTlSettings", "open-setting", "设置")}
+          ${iconButton("iconTlRefresh", "refresh", "刷新")}
         </div>
       </div>
     `;
@@ -815,8 +929,8 @@ class TimeListPlugin extends Plugin {
   renderViewTabs() {
     return `
       <div class="time-list-tabs">
-        <button class="${this.currentDockView === "tasks" ? "is-active" : ""}" data-action="switch-view" data-view="tasks">任务列表</button>
-        <button class="${this.currentDockView === "summary" ? "is-active" : ""}" data-action="switch-view" data-view="summary">今日总结</button>
+        <button class="${this.currentDockView === "tasks" ? "is-active" : ""}" data-action="switch-view" data-view="tasks">${icon("iconTlList")}<span>任务</span></button>
+        <button class="${this.currentDockView === "summary" ? "is-active" : ""}" data-action="switch-view" data-view="summary">${icon("iconTlPie")}<span>总结</span></button>
       </div>
     `;
   }
@@ -842,13 +956,9 @@ class TimeListPlugin extends Plugin {
     return `
       <div class="time-list-dashboard">
         <button class="time-list-create-card" data-action="open-create-task">
-          <span class="time-list-create-plus">＋</span>
-          <span>
-            <strong>新建今日任务</strong>
-            <em>${this.settings.notebookId ? "创建后写入今日日记" : "未选笔记本时只保存到插件"}</em>
-          </span>
+          ${icon("iconTlPlus")}
+          <strong>新建</strong>
         </button>
-        ${this.settings.notebookId ? "" : `<div class="time-list-note">还没有选择固定日记笔记本；任务会先保存在插件数据里，不会写入任何笔记本。</div>`}
       </div>
     `;
   }
@@ -860,17 +970,19 @@ class TimeListPlugin extends Plugin {
       const elapsedMs = getActiveElapsedMs(active);
       return `
         <div class="time-list-timer">
-          <div class="time-list-timer-title">正向专注计时中</div>
-          <div class="time-list-clock">${formatClock(elapsedMs)}</div>
-          <div class="time-list-timer-task">${escapeHtml(task?.title || "任务已不存在")} · 停止后记录实际用时</div>
-          <div class="time-list-actions">
+          <div class="time-list-timer-head">
+            ${icon("iconTlClock")}
+            <span>${escapeHtml(task?.title || "任务已不存在")}</span>
+            <strong>${formatClock(elapsedMs)}</strong>
+          </div>
+          <div class="time-list-icon-group time-list-icon-group--center">
             ${
               active.isPaused
-                ? `<button class="time-list-button" data-action="resume-pomodoro">继续</button>`
-                : `<button class="time-list-button time-list-button--muted" data-action="pause-pomodoro">暂停</button>`
+                ? iconButton("iconTlPlay", "resume-pomodoro", "继续")
+                : iconButton("iconTlPause", "pause-pomodoro", "暂停")
             }
-            <button class="time-list-button" data-action="finish-pomodoro">停止并记录</button>
-            <button class="time-list-button time-list-button--danger" data-action="cancel-pomodoro">取消</button>
+            ${iconButton("iconTlStop", "finish-pomodoro", "停止并记录")}
+            ${iconButton("iconTlClose", "cancel-pomodoro", "取消", "danger")}
           </div>
         </div>
       `;
@@ -913,8 +1025,8 @@ class TimeListPlugin extends Plugin {
         </div>
         <div class="time-list-chart-body">
           ${pie}
-          <div class="time-list-bars">${bars || `<div class="time-list-note">完成任务后，这里会出现今天的时间分布图。</div>`}</div>
         </div>
+        <div class="time-list-bars">${bars || `<div class="time-list-note">暂无数据</div>`}</div>
       </div>
     `;
   }
@@ -935,21 +1047,18 @@ class TimeListPlugin extends Plugin {
 
   renderTaskItem(task) {
     const pomodoroMinutes = totalPomodoroMinutes(task);
-    const actual = task.status === "completed" ? `<span class="time-list-pill">实际 ${formatMinutes(task.actualMinutes)}</span>` : "";
-    const pomodoro = `<span class="time-list-pill">番茄 ${formatMinutes(pomodoroMinutes)}</span>`;
     const status = normalizeTaskStatus(task);
+    const minutes = status === "completed" ? task.actualMinutes : pomodoroMinutes;
+    const timeText = minutes ? formatCompactMinutes(minutes) : "0m";
 
     return `
       <div class="time-list-item time-list-item--${status}" data-task-id="${task.id}">
-        <div class="time-list-item-main">
-          <div>
-            <div class="time-list-item-name">
-              <span>${escapeHtml(task.title)}</span>
-              <em>${taskStatusLabel(status)}</em>
-            </div>
-            <div class="time-list-item-meta">${pomodoro}${actual}</div>
-          </div>
+        <div class="time-list-item-head">
+          <strong>${task.source === "habit" ? "习惯" : status === "completed" ? "今天" : "全天"}</strong>
+          <span>${icon("iconTlClock")}${timeText}</span>
+          <em>${taskStatusLabel(status)}</em>
         </div>
+        <div class="time-list-item-name">${escapeHtml(task.title)}</div>
         ${
           status === "completed"
             ? this.renderCompletedActions(task)
@@ -964,29 +1073,27 @@ class TimeListPlugin extends Plugin {
   renderPendingActions(task) {
     return `
       <div class="time-list-actions">
-        <button class="time-list-button" data-action="show-complete" data-task-id="${task.id}">完成</button>
-        <button class="time-list-button time-list-button--muted" data-action="start-pomodoro" data-task-id="${task.id}" ${this.state.activePomodoro ? "disabled" : ""}>专注</button>
-        <button class="time-list-button time-list-button--danger" data-action="abandon-task" data-task-id="${task.id}">放弃</button>
+        ${iconButton("iconTlCheck", "show-complete", "完成", "", task.id)}
+        ${iconButton("iconTlClock", "start-pomodoro", "开始番茄", "", task.id, this.state.activePomodoro)}
+        ${iconButton("iconTlClose", "abandon-task", "放弃", "danger", task.id)}
       </div>
     `;
   }
 
   renderCompletedActions(task) {
     return `
-      <div class="time-list-note">${escapeHtml(task.note || "已完成")}</div>
       <div class="time-list-actions">
-        <button class="time-list-button time-list-button--muted" data-action="reopen-task" data-task-id="${task.id}">重新打开</button>
-        <button class="time-list-button time-list-button--danger" data-action="delete-task" data-task-id="${task.id}">删除</button>
+        ${iconButton("iconTlUndo", "reopen-task", "恢复", "", task.id)}
+        ${iconButton("iconTlTrash", "delete-task", "删除", "danger", task.id)}
       </div>
     `;
   }
 
   renderAbandonedActions(task) {
     return `
-      <div class="time-list-note">已放弃</div>
       <div class="time-list-actions">
-        <button class="time-list-button time-list-button--muted" data-action="reopen-task" data-task-id="${task.id}">恢复</button>
-        <button class="time-list-button time-list-button--danger" data-action="delete-task" data-task-id="${task.id}">删除</button>
+        ${iconButton("iconTlUndo", "reopen-task", "恢复", "", task.id)}
+        ${iconButton("iconTlTrash", "delete-task", "删除", "danger", task.id)}
       </div>
     `;
   }
@@ -997,13 +1104,16 @@ class TimeListPlugin extends Plugin {
       return;
     }
 
-    root.querySelector("[data-action='refresh']")?.addEventListener("click", () => this.render());
     root.querySelector("[data-action='open-setting']")?.addEventListener("click", () => this.openSetting());
     root.querySelector("[data-action='open-create-task']")?.addEventListener("click", () => this.openCreateTaskDialog());
+    root.querySelector("[data-action='refresh']")?.addEventListener("click", async () => {
+      await this.importHabitsForToday({ silent: false });
+      this.render();
+    });
 
     root.querySelectorAll("[data-action]").forEach((button) => {
       const action = button.dataset.action;
-      if (["refresh", "open-setting", "open-create-task"].includes(action)) {
+      if (["open-setting", "open-create-task", "refresh"].includes(action)) {
         return;
       }
       button.addEventListener("click", async () => {
@@ -1054,21 +1164,76 @@ function todayKey() {
   return `${year}-${month}-${day}`;
 }
 
-function currentTimeValue() {
-  const date = new Date();
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-}
-
 function parseTaskTitles(rawText) {
   return [...new Set(String(rawText)
     .split(/\n+/)
-    .map((line) => line
-      .trim()
-      .replace(/^[-*+]\s+/, "")
-      .replace(/^\d+[.)、]\s+/, "")
-      .replace(/^\[[ xX]\]\s+/, "")
-      .trim())
+    .map(cleanTaskLine)
     .filter(Boolean))];
+}
+
+function parseHabitTitles(markdown) {
+  const titles = [];
+  let inCodeBlock = false;
+  let inFrontmatter = false;
+  let hasSeenContent = false;
+  for (const rawLine of String(markdown || "").split(/\n+/)) {
+    const line = rawLine.trim();
+    if (!hasSeenContent && line === "---") {
+      inFrontmatter = true;
+      hasSeenContent = true;
+      continue;
+    }
+    if (inFrontmatter) {
+      if (line === "---") {
+        inFrontmatter = false;
+      }
+      continue;
+    }
+    if (line.startsWith("```") || line.startsWith("~~~")) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock || !line || line.startsWith("#") || line.startsWith("|") || line === "---" || isMetadataLine(line)) {
+      continue;
+    }
+    hasSeenContent = true;
+    const title = cleanTaskLine(line);
+    if (title && !isMetadataLine(title)) {
+      titles.push(title);
+    }
+  }
+  return [...new Set(titles)];
+}
+
+function isMetadataLine(line) {
+  const text = String(line || "").trim();
+  if (!text) {
+    return true;
+  }
+  if (/^(title|date|lastmod|updated|created|modified|tags|categories|aliases|id|type|status|author|description|slug)\s*[:：]/i.test(text)) {
+    return true;
+  }
+  if (/^[a-zA-Z_][\w-]{0,32}\s*[:：]\s*\S+/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+function cleanTaskLine(line) {
+  return String(line)
+    .trim()
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+[.)、]\s+/, "")
+    .replace(/^\[[ xX]\]\s+/, "")
+    .replace(/^【.*?】\s*/, "")
+    .replace(/\s*#\S+#?\s*$/g, "")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/[`*_~]/g, "")
+    .trim();
+}
+
+function normalizeTitleKey(title) {
+  return cleanTaskLine(title).replace(/\s+/g, "").toLowerCase();
 }
 
 function normalizeTaskStatus(task) {
@@ -1094,23 +1259,6 @@ function clampNumber(value, min, max, fallback) {
     return fallback;
   }
   return Math.min(max, Math.max(min, Math.round(number)));
-}
-
-function diffTimeInputs(startTime, endTime) {
-  if (!startTime || !endTime) {
-    return 0;
-  }
-  const [startHour, startMinute] = startTime.split(":").map(Number);
-  const [endHour, endMinute] = endTime.split(":").map(Number);
-  if ([startHour, startMinute, endHour, endMinute].some((part) => !Number.isFinite(part))) {
-    return 0;
-  }
-  const start = startHour * 60 + startMinute;
-  let end = endHour * 60 + endMinute;
-  if (end < start) {
-    end += 24 * 60;
-  }
-  return end - start;
 }
 
 function totalPomodoroMinutes(task) {
@@ -1143,11 +1291,44 @@ function formatMinutes(minutes) {
   return rest ? `${hours} 小时 ${rest} 分钟` : `${hours} 小时`;
 }
 
+function formatCompactMinutes(minutes) {
+  const normalized = Number(minutes) || 0;
+  if (normalized < 60) {
+    return `${normalized}m`;
+  }
+  const hours = Math.floor(normalized / 60);
+  const rest = normalized % 60;
+  return rest ? `${hours}h${rest}m` : `${hours}h`;
+}
+
 function formatPercent(minutes, total) {
   if (!total) {
     return "0%";
   }
   return `${Math.round((minutes / total) * 100)}%`;
+}
+
+function icon(name) {
+  return `<svg class="time-list-icon" aria-hidden="true"><use xlink:href="#${name}"></use></svg>`;
+}
+
+function iconButton(iconName, action, label, variant = "", taskId = "", disabled = false) {
+  const classes = ["time-list-icon-button"];
+  if (variant) {
+    classes.push(`time-list-icon-button--${variant}`);
+  }
+  return `
+    <button
+      class="${classes.join(" ")}"
+      data-action="${action}"
+      ${taskId ? `data-task-id="${escapeAttr(taskId)}"` : ""}
+      title="${escapeAttr(label)}"
+      aria-label="${escapeAttr(label)}"
+      ${disabled ? "disabled" : ""}
+    >
+      ${icon(iconName)}
+    </button>
+  `;
 }
 
 function renderPieSvg(tasks, total) {
