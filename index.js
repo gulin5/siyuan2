@@ -12,6 +12,7 @@ const {
 const DATA_KEY = "time-list-data.json";
 const SETTINGS_KEY = "time-list-settings.json";
 const DOCK_TYPE = "time-list";
+const REALTIME_SYNC_INTERVAL_MS = 2000;
 const PIE_COLORS = ["#5b8def", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#f97316", "#84cc16"];
 const WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const ICONS = `
@@ -67,16 +68,28 @@ class TimeListPlugin extends Plugin {
     this.timerHandle = null;
     this.autoSyncTimer = null;
     this.boundWsMainHandler = null;
+    this.lastDailyNoteWriteAt = 0;
+    this.lastRealtimeSyncAt = 0;
+    this.realtimeSyncInFlight = false;
+    this.locallyDeletedBlockIds = new Map();
+    this.recentLocalTaskChanges = new Map();
     this.isMobile = false;
   }
 
   async onload() {
     this.addIcons(ICONS);
     this.isMobile = ["mobile", "browser-mobile"].includes(getFrontend());
+    this.registerDateInsertActions();
     this.addCommand({
       langKey: "openTimeList",
       hotkey: "",
       callback: () => this.openDock(),
+    });
+    this.addCommand({
+      langKey: "insertTodayDate",
+      hotkey: "",
+      editorCallback: (protyle) => this.insertTodayDate(protyle),
+      callback: () => this.copyTodayDate(),
     });
     this.boundWsMainHandler = (event) => this.handleWsMain(event);
     this.eventBus.on("ws-main", this.boundWsMainHandler);
@@ -363,11 +376,59 @@ class TimeListPlugin extends Plugin {
     }
   }
 
+  registerDateInsertActions() {
+    this.protyleSlash = [
+      {
+        filter: ["date", "today", "rq", "jt", "日期", "今天", "今天日期"],
+        html: `
+          <div class="b3-list-item__first">
+            <span class="b3-list-item__text">插入今天日期</span>
+            <span class="b3-list-item__meta">${todayKey()}</span>
+          </div>
+        `,
+        id: "time-list-insert-today-date",
+        callback: (protyle) => this.insertTodayDate(protyle),
+      },
+    ];
+  }
+
+  insertTodayDate(protyle) {
+    const date = todayKey();
+    if (!protyle || typeof protyle.insert !== "function") {
+      this.copyTodayDate();
+      return;
+    }
+    protyle.insert(date, false);
+    this.scheduleDateInsertSync();
+  }
+
+  scheduleDateInsertSync() {
+    [700, 1800].forEach((delay) => window.setTimeout(async () => {
+      await this.syncDockFromDailyNote();
+    }, delay));
+  }
+
+  async copyTodayDate() {
+    const date = todayKey();
+    try {
+      await navigator.clipboard.writeText(date);
+      showMessage(`已复制今天日期：${date}`);
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to copy today date", error);
+      showMessage(`今天日期：${date}`);
+    }
+  }
+
   startTicker() {
     this.stopTicker();
     this.timerHandle = window.setInterval(async () => {
       if (this.state.activePomodoro) {
         this.render();
+      }
+      const now = Date.now();
+      if (this.shouldRealtimeSync(now)) {
+        this.lastRealtimeSyncAt = now;
+        await this.syncDockFromDailyNote();
       }
     }, 1000);
   }
@@ -397,14 +458,41 @@ class TimeListPlugin extends Plugin {
     this.stopAutoSync();
     this.autoSyncTimer = window.setTimeout(async () => {
       this.autoSyncTimer = null;
-      await this.syncTodayFromDailyNote({ silent: true });
-      if (this.calendarDialog) {
-        this.refreshCalendarDialog();
-      }
-      if (this.dockElement) {
-        this.render();
-      }
+      await this.syncDockFromDailyNote({ forceRender: true });
     }, 450);
+  }
+
+  shouldRealtimeSync(now = Date.now()) {
+    return Boolean(
+      this.dockElement &&
+      this.settings.notebookId &&
+      !this.realtimeSyncInFlight &&
+      now - this.lastRealtimeSyncAt >= REALTIME_SYNC_INTERVAL_MS
+    );
+  }
+
+  async syncDockFromDailyNote({ forceRender = false } = {}) {
+    if (this.realtimeSyncInFlight || !this.settings.notebookId) {
+      return;
+    }
+    this.realtimeSyncInFlight = true;
+    const beforeSignature = this.getTodayTaskSignature();
+    try {
+      await this.syncTodayFromDailyNote({ silent: true });
+      const afterSignature = this.getTodayTaskSignature();
+      if (forceRender || afterSignature !== beforeSignature) {
+        if (this.calendarDialog) {
+          this.refreshCalendarDialog();
+        }
+        if (this.dockElement) {
+          this.render();
+        }
+      }
+    } catch (error) {
+      console.warn("[siyuan-time-list] realtime sync failed", error);
+    } finally {
+      this.realtimeSyncInFlight = false;
+    }
   }
 
   async request(path, payload = {}) {
@@ -464,6 +552,7 @@ class TimeListPlugin extends Plugin {
     if (!this.canWriteDailyNote()) {
       return false;
     }
+    this.lastDailyNoteWriteAt = Date.now();
     const markdown = formatDailyTaskRecord(task, status, options);
     let changed = false;
     if (!task.blockId) {
@@ -477,6 +566,7 @@ class TimeListPlugin extends Plugin {
           dataType: "markdown",
           data: markdown,
         });
+        this.lastDailyNoteWriteAt = Date.now();
         return changed;
       } catch (error) {
         console.warn("[siyuan-time-list] failed to update task block, append instead", error);
@@ -488,9 +578,13 @@ class TimeListPlugin extends Plugin {
     const blockId = extractBlockId(result);
     if (blockId) {
       task.blockId = blockId;
+      this.lastDailyNoteWriteAt = Date.now();
+      this.markRecentLocalTaskChange(task);
       return true;
     }
     task.blockId = await this.findDailyTaskBlockId(task);
+    this.lastDailyNoteWriteAt = Date.now();
+    this.markRecentLocalTaskChange(task);
     return Boolean(task.blockId) || changed;
   }
 
@@ -517,8 +611,11 @@ class TimeListPlugin extends Plugin {
     if (!task.blockId) {
       return;
     }
+    this.lastDailyNoteWriteAt = Date.now();
+    this.locallyDeletedBlockIds.set(task.blockId, this.lastDailyNoteWriteAt);
     try {
       await this.request("/api/block/deleteBlock", { id: task.blockId });
+      this.lastDailyNoteWriteAt = Date.now();
     } catch (error) {
       console.warn("[siyuan-time-list] failed to delete task block", error);
     }
@@ -533,7 +630,7 @@ class TimeListPlugin extends Plugin {
       "select id, markdown, content, created, updated from blocks",
       `where box = '${escapeSql(notebook)}'`,
       "and type <> 'd'",
-      `and (markdown like '%📅${escapeSql(date)}%' or content like '%📅${escapeSql(date)}%')`,
+      `and (markdown like '%${escapeSql(date)}%' or content like '%${escapeSql(date)}%')`,
       "order by created asc",
     ].join(" ");
     const rows = await this.request("/api/query/sql", { stmt });
@@ -568,12 +665,22 @@ class TimeListPlugin extends Plugin {
 
   mergeDailyTaskRecords(records, date) {
     let changed = false;
+    const now = Date.now();
+    this.pruneRecentLocalTaskChanges(now);
+    for (const [blockId, deletedAt] of this.locallyDeletedBlockIds) {
+      if (now - deletedAt > 8000) {
+        this.locallyDeletedBlockIds.delete(blockId);
+      }
+    }
+    const effectiveRecords = dedupeDailyTaskRecords(records.filter((record) => {
+      return !record.blockId || !this.locallyDeletedBlockIds.has(record.blockId);
+    }));
     const byBlockId = new Map(this.state.tasks.filter((task) => task.blockId).map((task) => [task.blockId, task]));
-    const byKey = new Map(this.state.tasks.map((task) => [`${task.date || date}|${normalizeTitleKey(task.title)}`, task]));
-    const seenBlockIds = new Set(records.map((record) => record.blockId).filter(Boolean));
+    const byKey = new Map(this.state.tasks.map((task) => [taskMergeKey(task, date), task]));
+    const seenBlockIds = new Set(effectiveRecords.map((record) => record.blockId).filter(Boolean));
 
-    records.forEach((record) => {
-      const key = `${record.date}|${normalizeTitleKey(record.title)}`;
+    effectiveRecords.forEach((record) => {
+      const key = recordMergeKey(record);
       let task = record.blockId ? byBlockId.get(record.blockId) : null;
       task = task || byKey.get(key);
       if (!task) {
@@ -598,6 +705,14 @@ class TimeListPlugin extends Plugin {
         return;
       }
 
+      if (this.hasRecentLocalTaskChange(task, key)) {
+        if (record.blockId && task.blockId !== record.blockId) {
+          task.blockId = record.blockId;
+          changed = true;
+        }
+        return;
+      }
+
       const nextValues = {
         title: record.title,
         date: record.date,
@@ -618,15 +733,18 @@ class TimeListPlugin extends Plugin {
       });
     });
 
-    const before = this.state.tasks.length;
-    this.state.tasks = this.state.tasks.filter((task) => {
-      return !(task.date === date && task.blockId && !seenBlockIds.has(task.blockId));
-    });
-    if (this.state.tasks.length !== before) {
-      if (this.state.activePomodoro && !this.findTask(this.state.activePomodoro.taskId)) {
-        this.state.activePomodoro = null;
+    const canRemoveMissingBlockTasks = now - this.lastDailyNoteWriteAt > 8000;
+    if (canRemoveMissingBlockTasks) {
+      const before = this.state.tasks.length;
+      this.state.tasks = this.state.tasks.filter((task) => {
+        return !(task.date === date && task.blockId && !seenBlockIds.has(task.blockId));
+      });
+      if (this.state.tasks.length !== before) {
+        if (this.state.activePomodoro && !this.findTask(this.state.activePomodoro.taskId)) {
+          this.state.activePomodoro = null;
+        }
+        changed = true;
       }
-      changed = true;
     }
     return changed;
   }
@@ -722,9 +840,15 @@ class TimeListPlugin extends Plugin {
   }
 
   async addTasks(rawText) {
-    const titles = parseTaskTitles(rawText);
-    if (titles.length === 0) {
+    const parsedTitles = parseTaskTitles(rawText);
+    if (parsedTitles.length === 0) {
       showMessage("先写任务名称，一行一个。", 3000, "error");
+      return;
+    }
+    const existingKeys = new Set(this.getTodayTasks().map((task) => normalizeTitleKey(task.title)));
+    const titles = parsedTitles.filter((title) => !existingKeys.has(normalizeTitleKey(title)));
+    if (titles.length === 0) {
+      showMessage("今天已经有同名任务了。", 3000, "error");
       return;
     }
 
@@ -744,11 +868,13 @@ class TimeListPlugin extends Plugin {
     }));
 
     this.state.tasks.unshift(...tasks);
+    tasks.forEach((task) => this.markRecentLocalTaskChange(task));
     await this.saveState();
-    this.render();
+    this.render({ preserveScroll: false });
 
     try {
       await this.writeTasksToDailyNote(tasks);
+      this.render({ preserveScroll: false });
       showMessage(this.canWriteDailyNote() ? `已创建 ${tasks.length} 个任务，并写入今日日记` : `已创建 ${tasks.length} 个任务`);
     } catch (error) {
       showMessage(`任务已保存，但写入日记失败：${error.message}`, 5000, "error");
@@ -835,6 +961,7 @@ class TimeListPlugin extends Plugin {
     task.note = this.buildCompletionNote(mode, payload, minutes);
     task.summary = String(payload?.summary || "").trim();
 
+    this.markRecentLocalTaskChange(task);
     await this.saveState();
     this.render();
 
@@ -843,6 +970,7 @@ class TimeListPlugin extends Plugin {
       if (changed) {
         await this.saveState();
       }
+      this.render();
       showMessage("任务完成，时间也被好好收进篮子里了。");
     } catch (error) {
       showMessage(`任务已完成，但写入日记失败：${error.message}`, 5000, "error");
@@ -995,6 +1123,7 @@ class TimeListPlugin extends Plugin {
     task.completionMode = "";
     task.note = "";
     task.summary = "";
+    this.markRecentLocalTaskChange(task);
     await this.saveState();
     try {
       const changed = await this.writeTaskToDailyNote(task, "pending");
@@ -1021,6 +1150,7 @@ class TimeListPlugin extends Plugin {
     task.actualMinutes = 0;
     task.completionMode = "abandoned";
     task.note = "已放弃";
+    this.markRecentLocalTaskChange(task);
     await this.saveState();
     this.render();
 
@@ -1029,6 +1159,7 @@ class TimeListPlugin extends Plugin {
       if (changed) {
         await this.saveState();
       }
+      this.render();
       showMessage("已放弃任务");
     } catch (error) {
       showMessage(`任务已放弃，但写入日记失败：${error.message}`, 5000, "error");
@@ -1040,12 +1171,12 @@ class TimeListPlugin extends Plugin {
       await this.stopPomodoro(false);
     }
     const task = this.findTask(taskId);
-    if (task) {
-      await this.deleteDailyTaskBlock(task);
-    }
     this.state.tasks = this.state.tasks.filter((task) => task.id !== taskId);
     await this.saveState();
     this.render();
+    if (task) {
+      await this.deleteDailyTaskBlock(task);
+    }
   }
 
   async startPomodoro(taskId) {
@@ -1126,16 +1257,72 @@ class TimeListPlugin extends Plugin {
     return this.state.tasks.find((task) => task.id === taskId);
   }
 
+  markRecentLocalTaskChange(task) {
+    const changedAt = Date.now();
+    this.recentLocalTaskChanges.set(task.id, changedAt);
+    this.recentLocalTaskChanges.set(taskMergeKey(task), changedAt);
+  }
+
+  pruneRecentLocalTaskChanges(now = Date.now()) {
+    for (const [key, changedAt] of this.recentLocalTaskChanges) {
+      if (now - changedAt > 8000) {
+        this.recentLocalTaskChanges.delete(key);
+      }
+    }
+  }
+
+  hasRecentLocalTaskChange(task, recordKey) {
+    this.pruneRecentLocalTaskChanges();
+    return this.recentLocalTaskChanges.has(task.id) || this.recentLocalTaskChanges.has(recordKey);
+  }
+
   getTodayTasks() {
     const date = todayKey();
     return this.state.tasks.filter((task) => task.date === date);
+  }
+
+  getTodayTaskSignature() {
+    return JSON.stringify(this.getTodayTasks()
+      .map((task) => ({
+        key: taskMergeKey(task),
+        title: task.title,
+        status: normalizeTaskStatus(task),
+        actualMinutes: task.actualMinutes || 0,
+        pomodoroMinutes: totalPomodoroMinutes(task),
+        summary: task.summary || "",
+        blockId: task.blockId || "",
+      }))
+      .sort((left, right) => left.key.localeCompare(right.key)));
   }
 
   getCalendarTasks() {
     return this.state.tasks.filter((task) => isTaskInCalendarRange(task, this.calendarDate, this.calendarMode));
   }
 
-  render() {
+  captureScrollState() {
+    const scrollElement = this.dockElement?.querySelector(".time-list-scroll");
+    if (!scrollElement) {
+      return null;
+    }
+    return {
+      top: scrollElement.scrollTop,
+      left: scrollElement.scrollLeft,
+    };
+  }
+
+  restoreScrollState(scrollState) {
+    if (!scrollState) {
+      return;
+    }
+    const scrollElement = this.dockElement?.querySelector(".time-list-scroll");
+    if (!scrollElement) {
+      return;
+    }
+    scrollElement.scrollTop = scrollState.top;
+    scrollElement.scrollLeft = scrollState.left;
+  }
+
+  render({ preserveScroll = true } = {}) {
     if (!this.dockElement) {
       return;
     }
@@ -1148,6 +1335,7 @@ class TimeListPlugin extends Plugin {
     if (this.state.tasks.length !== beforeCleanup) {
       this.saveState();
     }
+    const scrollState = preserveScroll ? this.captureScrollState() : null;
     const todayTasks = this.getTodayTasks();
     const pendingTasks = todayTasks.filter((task) => task.status === "pending" || !task.status);
     const completedTasks = todayTasks.filter((task) => task.status === "completed");
@@ -1165,6 +1353,7 @@ class TimeListPlugin extends Plugin {
       </div>
     `;
     this.bindEvents();
+    this.restoreScrollState(scrollState);
   }
 
   renderHeader() {
@@ -1524,7 +1713,7 @@ class TimeListPlugin extends Plugin {
           this.openCompleteTaskDialog(taskId);
         } else if (action === "switch-view") {
           this.currentDockView = button.dataset.view || "tasks";
-          this.render();
+          this.render({ preserveScroll: false });
         } else if (action === "start-pomodoro") {
           await this.startPomodoro(taskId);
         } else if (action === "pause-pomodoro") {
@@ -1662,7 +1851,7 @@ function cleanTaskLine(line) {
     .replace(/^\d+[.)、]\s+/, "")
     .replace(/^\[[ xX]\]\s+/, "")
     .replace(/^【.*?】\s*/, "")
-    .replace(/\s*📅\s*\d{4}-\d{2}-\d{2}\s*/g, " ")
+    .replace(/\s*(?:\uD83D\uDCC5)?\s*\d{4}-\d{2}-\d{2}\s*/g, " ")
     .replace(/\s*(✅|✔️|☑️|🚫|❌)\s*/g, " ")
     .replace(/\s*⏱\s*\S+\s*/g, " ")
     .replace(/\s*用时\s*\S+\s*/g, " ")
@@ -1686,7 +1875,7 @@ function formatDailyTaskRecord(task, status = normalizeTaskStatus(task), options
 
 function formatDailyTaskLine(task, status = normalizeTaskStatus(task), options = {}) {
   const date = task.date || todayKey();
-  const parts = [escapeMarkdown(task.title), `📅${date}`];
+  const parts = [escapeMarkdown(task.title), date];
   if (status === "completed") {
     const minutes = Number(options.minutes ?? task.actualMinutes) || 0;
     parts.push("✅");
@@ -1701,6 +1890,44 @@ function formatDailyTaskLine(task, status = normalizeTaskStatus(task), options =
 
 function normalizeTitleKey(title) {
   return cleanTaskLine(title).replace(/\s+/g, "").toLowerCase();
+}
+
+function taskMergeKey(task, fallbackDate = todayKey()) {
+  return `${task.date || fallbackDate}|${normalizeTitleKey(task.title)}`;
+}
+
+function recordMergeKey(record) {
+  return `${record.date || todayKey()}|${normalizeTitleKey(record.title)}`;
+}
+
+function dedupeDailyTaskRecords(records) {
+  const byKey = new Map();
+  records.forEach((record) => {
+    const key = recordMergeKey(record);
+    const current = byKey.get(key);
+    if (!current || compareDailyTaskRecord(record, current) > 0) {
+      byKey.set(key, record);
+    }
+  });
+  return Array.from(byKey.values());
+}
+
+function compareDailyTaskRecord(left, right) {
+  const statusRank = {
+    pending: 0,
+    abandoned: 1,
+    completed: 2,
+  };
+  const statusDiff = (statusRank[left.status] || 0) - (statusRank[right.status] || 0);
+  if (statusDiff !== 0) {
+    return statusDiff;
+  }
+  const leftTime = Date.parse(left.createdAt || "") || 0;
+  const rightTime = Date.parse(right.createdAt || "") || 0;
+  if (leftTime !== rightTime) {
+    return leftTime - rightTime;
+  }
+  return left.blockId && !right.blockId ? 1 : 0;
 }
 
 function parseDailyTaskRecordsFromRows(rows) {
@@ -1724,7 +1951,7 @@ function parseDailyTaskRecordsFromRows(rows) {
 
 function parseDailyTaskRecord(line, row = {}) {
   const text = String(line || "").trim();
-  const dateMatch = /📅\s*(\d{4}-\d{2}-\d{2})/.exec(text);
+  const dateMatch = /(?:\uD83D\uDCC5\s*)?(\d{4}-\d{2}-\d{2})/.exec(text);
   if (!dateMatch) {
     return null;
   }
@@ -1766,7 +1993,7 @@ function shouldSyncFromWsEvent(event, tasks) {
   if (!haystack) {
     return false;
   }
-  if (haystack.includes(`📅${todayKey()}`)) {
+  if (haystack.includes(todayKey())) {
     return true;
   }
   return tasks
@@ -2151,21 +2378,37 @@ function extractBlockId(result) {
   if (typeof result === "string") {
     return result;
   }
-  if (result.id) {
-    return result.id;
+  if (typeof result !== "object") {
+    return "";
   }
-  if (result.blockId) {
-    return result.blockId;
+  if (result.id || result.blockId || result.blockID) {
+    return result.id || result.blockId || result.blockID;
   }
   if (Array.isArray(result)) {
-    return extractBlockId(result[0]);
+    for (const item of result) {
+      const blockId = extractBlockId(item);
+      if (blockId) {
+        return blockId;
+      }
+    }
+    return "";
   }
   const operations = [
     ...(Array.isArray(result.doOperations) ? result.doOperations : []),
     ...(Array.isArray(result.transactions) ? result.transactions.flatMap((item) => item.doOperations || []) : []),
+    ...(Array.isArray(result.data) ? result.data.flatMap((item) => item?.doOperations || item || []) : []),
   ];
   const operation = operations.find((item) => item?.id || item?.blockID);
-  return operation?.id || operation?.blockID || "";
+  if (operation?.id || operation?.blockID) {
+    return operation.id || operation.blockID;
+  }
+  for (const value of Object.values(result)) {
+    const blockId = extractBlockId(value);
+    if (blockId) {
+      return blockId;
+    }
+  }
+  return "";
 }
 
 module.exports = TimeListPlugin;
