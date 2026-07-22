@@ -525,27 +525,25 @@ class TimeListPlugin extends Plugin {
       return null;
     }
     const notebook = await this.ensureNotebookId();
-    try {
-      return await this.request("/api/block/appendDailyNoteBlock", {
-        notebook,
-        dataType: "markdown",
-        data: markdown,
-      });
-    } catch (error) {
-      const dailyNote = await this.request("/api/filetree/createDailyNote", {
-        notebook,
-        app: this.app?.appId,
-      });
-      const parentID = dailyNote?.id || dailyNote;
-      if (!parentID) {
-        throw error;
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        // appendDailyNoteBlock will create today's daily note when needed.
+        // Avoid forcing createDailyNote during cross-device sync gaps, which can
+        // create a duplicate "today" document before the existing one arrives.
+        return await this.request("/api/block/appendDailyNoteBlock", {
+          notebook,
+          dataType: "markdown",
+          data: markdown,
+        });
+      } catch (error) {
+        lastError = error;
+        if (attempt < 2) {
+          await sleep(400 * (attempt + 1));
+        }
       }
-      return await this.request("/api/block/appendBlock", {
-        parentID,
-        dataType: "markdown",
-        data: markdown,
-      });
     }
+    throw lastError || new Error("写入今日日记失败");
   }
 
   async writeTaskToDailyNote(task, status = normalizeTaskStatus(task), options = {}) {
@@ -1779,6 +1777,10 @@ function clone(value) {
     return structuredClone(value);
   }
   return JSON.parse(JSON.stringify(value));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function todayKey() {
