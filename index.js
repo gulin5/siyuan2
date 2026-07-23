@@ -77,6 +77,7 @@ class TimeListPlugin extends Plugin {
     this.lastActivePomodoroSyncMinute = -1;
     this.realtimeSyncInFlight = false;
     this.activePomodoroSyncInFlight = false;
+    this.habitImportPromise = null;
     this.locallyDeletedBlockIds = new Map();
     this.recentLocalTaskChanges = new Map();
     this.isMobile = false;
@@ -835,6 +836,18 @@ class TimeListPlugin extends Plugin {
   }
 
   async importHabitsForToday({ silent = true } = {}) {
+    if (this.habitImportPromise) {
+      return this.habitImportPromise;
+    }
+    this.habitImportPromise = this.runHabitImportForToday({ silent });
+    try {
+      return await this.habitImportPromise;
+    } finally {
+      this.habitImportPromise = null;
+    }
+  }
+
+  async runHabitImportForToday({ silent = true } = {}) {
     if (!this.settings.autoImportHabits || !this.settings.habitDocId) {
       return 0;
     }
