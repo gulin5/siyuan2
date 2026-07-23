@@ -815,15 +815,18 @@ class TimeListPlugin extends Plugin {
       return false;
     }
     const task = this.findTask(current.taskId);
-    if (!task || task.date !== date || this.hasRecentLocalTaskChange(task, taskMergeKey(task, date))) {
+    if (!task || task.date !== date) {
+      this.state.activePomodoro = null;
+      return true;
+    }
+    if (normalizeTaskStatus(task) !== "pending") {
+      this.state.activePomodoro = null;
+      return true;
+    }
+    if (this.hasRecentLocalTaskChange(task, taskMergeKey(task, date))) {
       return false;
     }
-    const absentUpdatedAt = Date.parse(activeAbsences.get(task.id) || "") || 0;
-    if (!absentUpdatedAt || absentUpdatedAt < (Number(current.startedAt) || 0)) {
-      return false;
-    }
-    this.state.activePomodoro = null;
-    return true;
+    return false;
   }
 
   canWriteDailyNote() {
@@ -2151,11 +2154,11 @@ function parseDailyTaskRecord(line, row = {}) {
     status,
     blockId: row.id || "",
     actualMinutes,
-    pomodoros: parsePomodoros(rawText, text, row),
-    activePomodoro: parseActivePomodoro(rawText, row),
-    summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
-  };
-}
+      pomodoros: parsePomodoros(rawText, text, row),
+      activePomodoro: parseActivePomodoro(rawText, text, row),
+      summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
+    };
+  }
 
 function stripTimeListComments(text) {
   return String(text || "").replace(/<!--\s*time-list:[\s\S]*?-->/g, "").trim();
@@ -2212,8 +2215,30 @@ function parsePomodoros(rawText, visibleText, row = {}) {
   }];
 }
 
-function parseActivePomodoro(rawText, row = {}) {
-  return normalizeActivePomodoro(parseTimeListAttr(row, ACTIVE_POMODORO_ATTR) || parseTimeListComment(rawText, "active-pomodoro"));
+function parseActivePomodoro(rawText, visibleText, row = {}) {
+  return normalizeActivePomodoro(
+    parseTimeListAttr(row, ACTIVE_POMODORO_ATTR)
+    || parseTimeListComment(rawText, "active-pomodoro")
+    || parseVisibleActivePomodoro(visibleText, row)
+  );
+}
+
+function parseVisibleActivePomodoro(text, row = {}) {
+  const match = /🍅\s*(▶|⏸)\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?/i.exec(String(text || ""));
+  if (!match || (!match[2] && !match[3] && !/0\s*m/i.test(match[0]))) {
+    return null;
+  }
+  const minutes = (Number(match[2]) || 0) * 60 + (Number(match[3]) || 0);
+  const baseTime = Date.parse(
+    row.updated ? siyuanTimeToIso(row.updated) : row.created ? siyuanTimeToIso(row.created) : ""
+  ) || Date.now();
+  const isPaused = match[1] === "⏸";
+  return {
+    startedAt: baseTime - minutes * 60000,
+    pausedAt: isPaused ? baseTime : null,
+    pausedMs: 0,
+    isPaused,
+  };
 }
 
 function parseTaskMinutes(text) {
