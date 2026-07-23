@@ -73,6 +73,7 @@ class TimeListPlugin extends Plugin {
     this.documentSyncInFlight = false;
     this.documentSyncQueued = false;
     this.refreshPromise = null;
+    this.calendarSyncPromises = new Map();
     this.dailyNoteId = "";
     this.dailyNoteDate = "";
     this.locallyDeletedBlockIds = new Map();
@@ -501,19 +502,93 @@ class TimeListPlugin extends Plugin {
   }
 
   async findExistingDailyNoteId(date = todayKey()) {
+    const dailyNoteIds = await this.findExistingDailyNoteIds([date]);
+    return dailyNoteIds.get(date) || "";
+  }
+
+  async findExistingDailyNoteIds(dates) {
     if (!this.settings.notebookId) {
-      return "";
+      return new Map();
     }
-    const compactDate = date.replace(/-/g, "");
-    const monthKey = compactDate.slice(0, 6);
+    const dateKeys = uniqueDateKeys(dates);
+    if (dateKeys.length === 0) {
+      return new Map();
+    }
+    const compactDates = new Set(dateKeys.map((date) => date.replace(/-/g, "")));
+    const monthConditions = Array.from(new Set(Array.from(compactDates).map((date) => date.slice(0, 6))))
+      .map((monthKey) => `name like 'custom-dailynote-${monthKey}__'`);
     const stmt = [
       "select id, ial from blocks",
       `where type = 'd' and box = '${escapeSql(this.settings.notebookId)}'`,
-      `and id in (select block_id from attributes where name like 'custom-dailynote-${monthKey}__')`,
+      `and id in (select block_id from attributes where ${monthConditions.join(" or ")})`,
     ].join(" ");
     const rows = await this.request("/api/query/sql", { stmt });
-    const marker = `custom-dailynote-${compactDate}`;
-    return String(rows?.find((row) => String(row.ial || "").includes(marker))?.id || "");
+    const dailyNoteIds = new Map();
+    (Array.isArray(rows) ? rows : []).forEach((row) => {
+      const date = detectDailyNoteDate(row, dateKeys);
+      if (date) {
+        dailyNoteIds.set(date, String(row.id || ""));
+      }
+    });
+    const missingDates = dateKeys.filter((date) => !dailyNoteIds.has(date));
+    if (missingDates.length > 0) {
+      const fallbackRows = await this.queryDateNamedDocs(missingDates);
+      fallbackRows.forEach((row) => {
+        const date = detectDailyNoteDate(row, missingDates);
+        if (date && !dailyNoteIds.has(date)) {
+          dailyNoteIds.set(date, String(row.id || ""));
+        }
+      });
+    }
+    const looseMissingDates = dateKeys.filter((date) => !dailyNoteIds.has(date));
+    if (looseMissingDates.length > 0 && looseMissingDates.length <= 60) {
+      const fallbackRows = await this.queryLooseDateNamedDocs(looseMissingDates);
+      fallbackRows.forEach((row) => {
+        const date = detectDailyNoteDate(row, looseMissingDates);
+        if (date && !dailyNoteIds.has(date)) {
+          dailyNoteIds.set(date, String(row.id || ""));
+        }
+      });
+    }
+    return dailyNoteIds;
+  }
+
+  async queryDateNamedDocs(dates) {
+    const years = Array.from(new Set(dates.map((date) => date.slice(0, 4))));
+    if (years.length === 0) {
+      return [];
+    }
+    const yearConditions = years.flatMap((year) => [
+      `content like '%${escapeSql(year)}%'`,
+      `markdown like '%${escapeSql(year)}%'`,
+      `hpath like '%${escapeSql(year)}%'`,
+    ]);
+    const stmt = [
+      "select id, ial, content, markdown, hpath from blocks",
+      `where type = 'd' and box = '${escapeSql(this.settings.notebookId)}'`,
+      `and (${yearConditions.join(" or ")})`,
+    ].join(" ");
+    const rows = await this.request("/api/query/sql", { stmt });
+    return Array.isArray(rows) ? rows : [];
+  }
+
+  async queryLooseDateNamedDocs(dates) {
+    const candidates = Array.from(new Set(dates.flatMap(getLooseDateNameCandidates)));
+    if (candidates.length === 0) {
+      return [];
+    }
+    const conditions = candidates.flatMap((candidate) => [
+      `content like '%${escapeSql(candidate)}%'`,
+      `markdown like '%${escapeSql(candidate)}%'`,
+      `hpath like '%${escapeSql(candidate)}%'`,
+    ]);
+    const stmt = [
+      "select id, ial, content, markdown, hpath from blocks",
+      `where type = 'd' and box = '${escapeSql(this.settings.notebookId)}'`,
+      `and (${conditions.join(" or ")})`,
+    ].join(" ");
+    const rows = await this.request("/api/query/sql", { stmt });
+    return Array.isArray(rows) ? rows : [];
   }
 
   async ensureExistingDailyNoteId(date = todayKey()) {
@@ -648,6 +723,23 @@ class TimeListPlugin extends Plugin {
     return Array.isArray(rows) ? rows : [];
   }
 
+  async queryDailyTaskBlocksForDailyNotes(dailyNoteIds) {
+    const ids = Array.from(new Set(Array.from(dailyNoteIds).filter(Boolean)));
+    if (ids.length === 0) {
+      return [];
+    }
+    const notebook = await this.ensureNotebookId();
+    const stmt = [
+      "select id, markdown, content, ial, created, updated from blocks",
+      `where box = '${escapeSql(notebook)}'`,
+      "and type <> 'd'",
+      `and root_id in (${ids.map((id) => `'${escapeSql(id)}'`).join(", ")})`,
+      "order by created asc",
+    ].join(" ");
+    const rows = await this.request("/api/query/sql", { stmt });
+    return Array.isArray(rows) ? rows : [];
+  }
+
   async syncTodayFromDailyNote({ silent = true } = {}) {
     if (!this.settings.notebookId) {
       return 0;
@@ -674,7 +766,74 @@ class TimeListPlugin extends Plugin {
     return records.length;
   }
 
-  mergeDailyTaskRecords(records, date) {
+  async syncDatesFromDailyNotes(dates, { silent = true, removeMissing = true, skipToday = false } = {}) {
+    if (!this.settings.notebookId) {
+      return 0;
+    }
+    const dateKeys = uniqueDateKeys(dates).filter((date) => !skipToday || date !== todayKey());
+    if (dateKeys.length === 0) {
+      return 0;
+    }
+    const dateSet = new Set(dateKeys);
+    let dailyNoteIds = new Map();
+    let rows = [];
+    try {
+      dailyNoteIds = await this.findExistingDailyNoteIds(dateKeys);
+      rows = await this.queryDailyTaskBlocksForDailyNotes(dailyNoteIds.values());
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to sync calendar daily notes", error);
+      if (!silent) {
+        showMessage(`同步任务日历失败：${error.message}`, 5000, "error");
+      }
+      return 0;
+    }
+
+    const recordsByDate = new Map();
+    parseDailyTaskRecordsFromRows(rows)
+      .filter((record) => dateSet.has(record.date))
+      .forEach((record) => {
+        if (!recordsByDate.has(record.date)) {
+          recordsByDate.set(record.date, []);
+        }
+        recordsByDate.get(record.date).push(record);
+      });
+
+    let changed = false;
+    for (const date of dateKeys) {
+      if (!dailyNoteIds.has(date)) {
+        continue;
+      }
+      changed = this.mergeDailyTaskRecords(recordsByDate.get(date) || [], date, { removeMissing }) || changed;
+    }
+    if (changed) {
+      await this.saveState();
+    }
+    if (!silent) {
+      showMessage(changed ? "已同步任务日历" : "任务日历已是最新");
+    }
+    return Array.from(recordsByDate.values()).reduce((sum, records) => sum + records.length, 0);
+  }
+
+  async syncCalendarFromDailyNotes({ silent = true } = {}) {
+    const visibleDates = getCalendarVisibleDates(this.calendarDate, this.calendarMode);
+    const syncKey = visibleDates.join("|");
+    if (this.calendarSyncPromises.has(syncKey)) {
+      return this.calendarSyncPromises.get(syncKey);
+    }
+    const syncPromise = this.syncDatesFromDailyNotes(visibleDates, {
+      silent,
+      removeMissing: false,
+      skipToday: true,
+    });
+    this.calendarSyncPromises.set(syncKey, syncPromise);
+    try {
+      return await syncPromise;
+    } finally {
+      this.calendarSyncPromises.delete(syncKey);
+    }
+  }
+
+  mergeDailyTaskRecords(records, date, { removeMissing = true } = {}) {
     let changed = false;
     const now = Date.now();
     this.pruneRecentLocalTaskChanges(now);
@@ -749,7 +908,7 @@ class TimeListPlugin extends Plugin {
       }
     });
 
-    const canRemoveMissingBlockTasks = now - this.lastDailyNoteWriteAt > 8000;
+    const canRemoveMissingBlockTasks = removeMissing && now - this.lastDailyNoteWriteAt > 8000;
     if (canRemoveMissingBlockTasks) {
       const before = this.state.tasks.length;
       this.state.tasks = this.state.tasks.filter((task) => {
@@ -1495,6 +1654,14 @@ class TimeListPlugin extends Plugin {
     });
 
     this.bindCalendarEvents(this.calendarDialog.element.querySelector(".time-list-calendar-dialog"));
+    const initialCalendarDate = this.calendarDate;
+    const initialCalendarMode = this.calendarMode;
+    this.syncCalendarFromDailyNotes({ silent: true })
+      .then(() => {
+        if (this.calendarDate === initialCalendarDate && this.calendarMode === initialCalendarMode) {
+          this.refreshCalendarDialog();
+        }
+      });
   }
 
   refreshCalendarDialog() {
@@ -1841,19 +2008,27 @@ class TimeListPlugin extends Plugin {
             this.calendarDate = todayKey();
           }
           this.refreshCalendarDialog();
+          await this.syncCalendarFromDailyNotes({ silent: true });
+          this.refreshCalendarDialog();
         } else if (action === "calendar-prev") {
           this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, -1);
+          this.refreshCalendarDialog();
+          await this.syncCalendarFromDailyNotes({ silent: true });
           this.refreshCalendarDialog();
         } else if (action === "calendar-next") {
           this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
           this.refreshCalendarDialog();
+          await this.syncCalendarFromDailyNotes({ silent: true });
+          this.refreshCalendarDialog();
         } else if (action === "calendar-refresh") {
-          await this.refreshToday({ silent: false });
+          await this.syncCalendarFromDailyNotes({ silent: false });
           this.refreshCalendarDialog();
           this.render();
         } else if (action === "calendar-jump-month") {
           this.calendarDate = button.dataset.date || this.calendarDate;
           this.calendarMode = "month";
+          this.refreshCalendarDialog();
+          await this.syncCalendarFromDailyNotes({ silent: true });
           this.refreshCalendarDialog();
         }
       });
@@ -2312,6 +2487,63 @@ function formatDateKey(date) {
   return `${year}-${month}-${day}`;
 }
 
+function formatCompactDateKey(date) {
+  return `${date.slice(0, 4)}-${date.slice(4, 6)}-${date.slice(6, 8)}`;
+}
+
+function uniqueDateKeys(dates) {
+  return Array.from(new Set((dates || []).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(String(date || ""))))).sort();
+}
+
+function detectDailyNoteDate(row, dates) {
+  const dateSet = new Set(dates);
+  const ial = String(row?.ial || "");
+  for (const match of ial.matchAll(/custom-dailynote-(\d{8})/g)) {
+    const date = formatCompactDateKey(match[1]);
+    if (dateSet.has(date)) {
+      return date;
+    }
+  }
+
+  const haystack = [
+    row?.content,
+    row?.markdown,
+    row?.hpath,
+  ].map((value) => String(value || "")).join("\n");
+
+  return dates.find((date) => {
+    return getDateNameCandidates(date).some((candidate) => haystack.includes(candidate));
+  }) || "";
+}
+
+function getDateNameCandidates(date) {
+  const [year, month, day] = String(date || "").split("-");
+  return [
+    `${year}-${month}-${day}`,
+    `${year}${month}${day}`,
+    `${year}/${month}/${day}`,
+    `${year}.${month}.${day}`,
+    `${year}_${month}_${day}`,
+    `${year}年${month}月${day}日`,
+    `${year}年${Number(month)}月${Number(day)}日`,
+    ...getLooseDateNameCandidates(date),
+  ];
+}
+
+function getLooseDateNameCandidates(date) {
+  const [, month, day] = String(date || "").split("-");
+  return [
+    `${Number(month)}月${Number(day)}日`,
+    `${month}月${day}日`,
+    `${Number(month)}/${Number(day)}`,
+    `${month}/${day}`,
+    `${Number(month)}-${Number(day)}`,
+    `${month}-${day}`,
+    `${Number(month)}.${Number(day)}`,
+    `${month}.${day}`,
+  ];
+}
+
 function formatCalendarTitle(dateKey, mode) {
   const date = parseDateKey(dateKey);
   if (mode === "year") {
@@ -2340,6 +2572,16 @@ function calendarModeLabel(mode) {
     return "周";
   }
   return "周";
+}
+
+function getCalendarVisibleDates(dateKey, mode) {
+  if (mode === "year") {
+    return getYearDates(dateKey);
+  }
+  if (mode === "month") {
+    return getMonthGridDates(dateKey);
+  }
+  return getWeekDates(dateKey);
 }
 
 function getWeekRange(dateKey) {
@@ -2374,6 +2616,16 @@ function getMonthGridDates(dateKey) {
     current.setDate(start.getDate() + index);
     return formatDateKey(current);
   });
+}
+
+function getYearDates(dateKey) {
+  const year = parseDateKey(dateKey).getFullYear();
+  const start = new Date(year, 0, 1);
+  const dates = [];
+  for (const date = new Date(start); date.getFullYear() === year; date.setDate(date.getDate() + 1)) {
+    dates.push(formatDateKey(date));
+  }
+  return dates;
 }
 
 function getIsoWeekNumber(date) {
