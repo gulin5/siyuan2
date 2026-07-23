@@ -12,8 +12,7 @@ const {
 const DATA_KEY = "time-list-data.json";
 const SETTINGS_KEY = "time-list-settings.json";
 const DOCK_TYPE = "time-list";
-const REALTIME_SYNC_INTERVAL_MS = 2000;
-const ACTIVE_POMODORO_SYNC_INTERVAL_MS = 60000;
+const DOCUMENT_SAVE_SYNC_DELAY_MS = 900;
 const POMODOROS_ATTR = "custom-time-list-pomodoros";
 const ACTIVE_POMODORO_ATTR = "custom-time-list-active-pomodoro";
 const PIE_COLORS = ["#5b8def", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#f97316", "#84cc16"];
@@ -46,7 +45,6 @@ const defaultSettings = {
   notebookId: "",
   autoAppendToDailyNote: true,
   habitDocId: "",
-  autoImportHabits: true,
 };
 
 const defaultState = {
@@ -69,15 +67,14 @@ class TimeListPlugin extends Plugin {
     this.calendarMode = "week";
     this.calendarDate = todayKey();
     this.timerHandle = null;
-    this.autoSyncTimer = null;
+    this.documentSyncTimer = null;
     this.boundWsMainHandler = null;
     this.lastDailyNoteWriteAt = 0;
-    this.lastRealtimeSyncAt = 0;
-    this.lastActivePomodoroSyncAt = 0;
-    this.lastActivePomodoroSyncMinute = -1;
-    this.realtimeSyncInFlight = false;
-    this.activePomodoroSyncInFlight = false;
-    this.habitImportPromise = null;
+    this.documentSyncInFlight = false;
+    this.documentSyncQueued = false;
+    this.refreshPromise = null;
+    this.dailyNoteId = "";
+    this.dailyNoteDate = "";
     this.locallyDeletedBlockIds = new Map();
     this.recentLocalTaskChanges = new Map();
     this.isMobile = false;
@@ -108,7 +105,6 @@ class TimeListPlugin extends Plugin {
       this.registerDock();
       await this.setupSettings();
       await this.syncTodayFromDailyNote({ silent: true });
-      await this.importHabitsForToday({ silent: true });
       this.startTicker();
       showMessage("日记任务计时插件已加载");
     } catch (error) {
@@ -119,7 +115,7 @@ class TimeListPlugin extends Plugin {
 
   onunload() {
     this.stopTicker();
-    this.stopAutoSync();
+    this.stopDocumentSync();
     if (this.boundWsMainHandler) {
       this.eventBus.off("ws-main", this.boundWsMainHandler);
       this.boundWsMainHandler = null;
@@ -203,19 +199,14 @@ class TimeListPlugin extends Plugin {
     habitDocInput.placeholder = "习惯文档 ID";
     habitDocInput.value = this.settings.habitDocId || "";
 
-    const habitToggle = document.createElement("input");
-    habitToggle.type = "checkbox";
-    habitToggle.checked = this.settings.autoImportHabits;
-
     this.setting = new Setting({
       confirmCallback: async () => {
         this.settings.notebookId = notebookSelect.value;
+        this.resetDailyNoteCache();
         this.settings.autoAppendToDailyNote = appendToggle.checked;
         this.settings.habitDocId = habitDocInput.value.trim();
-        this.settings.autoImportHabits = habitToggle.checked;
         await this.saveSettings();
         await this.syncTodayFromDailyNote({ silent: true });
-        await this.importHabitsForToday({ silent: false });
         this.render();
         showMessage("日记任务计时设置已保存");
       },
@@ -223,27 +214,22 @@ class TimeListPlugin extends Plugin {
 
     this.setting.addItem({
       title: "日记笔记本",
-      description: "新任务会追加到这个笔记本的今日日记里。",
+      description: "用于筛选可写入的已有文档。",
       createActionElement: () => notebookSelect,
     });
 
     this.setting.addItem({
-      title: "写入今日日记",
-      description: "创建任务和完成任务时向日记追加一条记录。",
+      title: "写入任务文档",
+      description: "创建任务和完成任务时向已选择的文档追加一条记录。",
       createActionElement: () => appendToggle,
     });
 
     this.setting.addItem({
       title: "习惯文档 ID",
-      description: "每天自动读取这个文档里的每一行，创建为今日习惯任务。",
+      description: "点击刷新时读取这个文档里的每一行，创建为今日习惯任务。",
       createActionElement: () => habitDocInput,
     });
 
-    this.setting.addItem({
-      title: "自动导入习惯",
-      description: "插件加载或刷新时，为今天补齐习惯任务。",
-      createActionElement: () => habitToggle,
-    });
   }
 
   async openSetting() {
@@ -262,11 +248,10 @@ class TimeListPlugin extends Plugin {
           })
           .join("")
       : `<option value="">未获取到可用笔记本</option>`;
-
     const content = `
       <div style="padding: 16px; display: flex; flex-direction: column; gap: 14px;">
         <div style="font-size: 14px; color: var(--b3-theme-on-surface); line-height: 1.6;">
-          配置任务写入哪个笔记本的今日日记。
+          任务会自动写入这个笔记本下已经存在的当天日记，不会自动创建文档。
         </div>
 
         <div style="display: flex; flex-direction: column; gap: 4px;">
@@ -275,24 +260,19 @@ class TimeListPlugin extends Plugin {
             ${notebookOptions}
           </select>
           <div style="font-size: 12px; color: var(--b3-theme-on-surface-light);">
-            新任务和完成记录会追加到这个笔记本的今日日记。
+            如果当天日记不存在，请先在思源里手动创建当天日记。
           </div>
         </div>
 
         <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--b3-theme-on-surface);">
           <input id="time-list-auto-append" type="checkbox" ${this.settings.autoAppendToDailyNote ? "checked" : ""} />
-          创建和完成任务时写入今日日记
+          创建和完成任务时写入任务文档
         </label>
 
         <div style="display: flex; flex-direction: column; gap: 4px;">
           <label style="font-size: 13px; font-weight: 500; color: var(--b3-theme-on-surface);">习惯文档 ID</label>
           <input id="time-list-habit-doc-id" class="b3-text-field" placeholder="粘贴习惯文档 ID" value="${escapeAttr(this.settings.habitDocId || "")}" style="width: 100%;" />
         </div>
-
-        <label style="display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--b3-theme-on-surface);">
-          <input id="time-list-auto-habits" type="checkbox" ${this.settings.autoImportHabits ? "checked" : ""} />
-          每天自动导入习惯任务
-        </label>
 
         <div id="time-list-setting-status" style="font-size: 13px; color: var(--b3-theme-on-surface-light);"></div>
 
@@ -317,7 +297,6 @@ class TimeListPlugin extends Plugin {
     const notebookSelect = root.querySelector("#time-list-notebook");
     const appendToggle = root.querySelector("#time-list-auto-append");
     const habitDocInput = root.querySelector("#time-list-habit-doc-id");
-    const habitToggle = root.querySelector("#time-list-auto-habits");
     const statusElement = root.querySelector("#time-list-setting-status");
     const cancelButton = root.querySelector("#time-list-cancel-settings");
     const saveButton = root.querySelector("#time-list-save-settings");
@@ -335,10 +314,9 @@ class TimeListPlugin extends Plugin {
         notebookId: notebookSelect.value,
         autoAppendToDailyNote: appendToggle.checked,
         habitDocId: habitDocInput.value.trim(),
-        autoImportHabits: habitToggle.checked,
       };
+      this.resetDailyNoteCache();
       await this.saveSettings();
-      await this.importHabitsForToday({ silent: false });
       this.render();
       showMessage("日记任务计时设置已保存 ✅");
       this.settingDialog?.destroy();
@@ -363,7 +341,6 @@ class TimeListPlugin extends Plugin {
         plugin.dockElement = this.element;
         plugin.render();
         plugin.syncTodayFromDailyNote({ silent: true })
-          .then(() => plugin.importHabitsForToday({ silent: true }))
           .then(() => plugin.render());
       },
       destroy() {
@@ -406,13 +383,6 @@ class TimeListPlugin extends Plugin {
       return;
     }
     protyle.insert(date, false);
-    this.scheduleDateInsertSync();
-  }
-
-  scheduleDateInsertSync() {
-    [700, 1800].forEach((delay) => window.setTimeout(async () => {
-      await this.syncDockFromDailyNote();
-    }, delay));
   }
 
   async copyTodayDate() {
@@ -432,12 +402,6 @@ class TimeListPlugin extends Plugin {
       if (this.state.activePomodoro) {
         this.render();
       }
-      const now = Date.now();
-      await this.syncActivePomodoroSnapshot(now);
-      if (this.shouldRealtimeSync(now)) {
-        this.lastRealtimeSyncAt = now;
-        await this.syncDockFromDailyNote();
-      }
     }, 1000);
   }
 
@@ -448,42 +412,41 @@ class TimeListPlugin extends Plugin {
     }
   }
 
-  stopAutoSync() {
-    if (this.autoSyncTimer) {
-      window.clearTimeout(this.autoSyncTimer);
-      this.autoSyncTimer = null;
+  stopDocumentSync() {
+    if (this.documentSyncTimer) {
+      window.clearTimeout(this.documentSyncTimer);
+      this.documentSyncTimer = null;
     }
   }
 
   handleWsMain(event) {
-    if (!this.dockElement || !this.settings.notebookId || !shouldSyncFromWsEvent(event, this.state.tasks)) {
+    if (!this.dockElement || !this.settings.notebookId || !shouldSyncAfterDocumentSave(event, this.dailyNoteId)) {
       return;
     }
-    this.scheduleAutoSync();
+    if (String(event?.detail?.cmd || "").toLowerCase() === "createdailynote") {
+      this.resetDailyNoteCache();
+    }
+    this.scheduleDocumentSync();
   }
 
-  scheduleAutoSync() {
-    this.stopAutoSync();
-    this.autoSyncTimer = window.setTimeout(async () => {
-      this.autoSyncTimer = null;
+  scheduleDocumentSync(delay = DOCUMENT_SAVE_SYNC_DELAY_MS) {
+    this.stopDocumentSync();
+    this.documentSyncTimer = window.setTimeout(async () => {
+      this.documentSyncTimer = null;
       await this.syncDockFromDailyNote({ forceRender: true });
-    }, 450);
-  }
-
-  shouldRealtimeSync(now = Date.now()) {
-    return Boolean(
-      this.dockElement &&
-      this.settings.notebookId &&
-      !this.realtimeSyncInFlight &&
-      now - this.lastRealtimeSyncAt >= REALTIME_SYNC_INTERVAL_MS
-    );
+    }, delay);
   }
 
   async syncDockFromDailyNote({ forceRender = false } = {}) {
-    if (this.realtimeSyncInFlight || !this.settings.notebookId) {
+    if (!this.settings.notebookId) {
       return;
     }
-    this.realtimeSyncInFlight = true;
+    if (this.documentSyncInFlight) {
+      this.documentSyncQueued = true;
+      return;
+    }
+    this.documentSyncInFlight = true;
+    this.documentSyncQueued = false;
     const beforeSignature = this.getTodayTaskSignature();
     try {
       await this.syncTodayFromDailyNote({ silent: true });
@@ -497,9 +460,13 @@ class TimeListPlugin extends Plugin {
         }
       }
     } catch (error) {
-      console.warn("[siyuan-time-list] realtime sync failed", error);
+      console.warn("[siyuan-time-list] document sync failed", error);
     } finally {
-      this.realtimeSyncInFlight = false;
+      this.documentSyncInFlight = false;
+      if (this.documentSyncQueued) {
+        this.documentSyncQueued = false;
+        this.scheduleDocumentSync();
+      }
     }
   }
 
@@ -528,30 +495,49 @@ class TimeListPlugin extends Plugin {
     throw new Error("请先在设置里选择你的固定日记笔记本。");
   }
 
+  resetDailyNoteCache() {
+    this.dailyNoteId = "";
+    this.dailyNoteDate = "";
+  }
+
+  async findExistingDailyNoteId(date = todayKey()) {
+    if (!this.settings.notebookId) {
+      return "";
+    }
+    const compactDate = date.replace(/-/g, "");
+    const monthKey = compactDate.slice(0, 6);
+    const stmt = [
+      "select id, ial from blocks",
+      `where type = 'd' and box = '${escapeSql(this.settings.notebookId)}'`,
+      `and id in (select block_id from attributes where name like 'custom-dailynote-${monthKey}__')`,
+    ].join(" ");
+    const rows = await this.request("/api/query/sql", { stmt });
+    const marker = `custom-dailynote-${compactDate}`;
+    return String(rows?.find((row) => String(row.ial || "").includes(marker))?.id || "");
+  }
+
+  async ensureExistingDailyNoteId(date = todayKey()) {
+    if (this.dailyNoteDate === date && this.dailyNoteId) {
+      return this.dailyNoteId;
+    }
+    this.dailyNoteDate = date;
+    this.dailyNoteId = await this.findExistingDailyNoteId(date);
+    return this.dailyNoteId;
+  }
+
   async appendDailyNote(markdown) {
     if (!this.canWriteDailyNote()) {
       return null;
     }
-    const notebook = await this.ensureNotebookId();
-    let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        // appendDailyNoteBlock will create today's daily note when needed.
-        // Avoid forcing createDailyNote during cross-device sync gaps, which can
-        // create a duplicate "today" document before the existing one arrives.
-        return await this.request("/api/block/appendDailyNoteBlock", {
-          notebook,
-          dataType: "markdown",
-          data: markdown,
-        });
-      } catch (error) {
-        lastError = error;
-        if (attempt < 2) {
-          await sleep(400 * (attempt + 1));
-        }
-      }
+    const dailyNoteId = await this.ensureExistingDailyNoteId();
+    if (!dailyNoteId) {
+      throw new Error("今天的日记文档不存在，请先在思源里手动创建。");
     }
-    throw lastError || new Error("写入今日日记失败");
+    return await this.request("/api/block/appendBlock", {
+      parentID: dailyNoteId,
+      dataType: "markdown",
+      data: markdown,
+    });
   }
 
   async writeTaskToDailyNote(task, status = normalizeTaskStatus(task), options = {}) {
@@ -561,7 +547,6 @@ class TimeListPlugin extends Plugin {
     this.lastDailyNoteWriteAt = Date.now();
     const markdown = formatDailyTaskRecord(task, status, {
       ...options,
-      activePomodoro: this.getTaskActivePomodoro(task),
     });
     let changed = false;
     if (!task.blockId) {
@@ -608,7 +593,7 @@ class TimeListPlugin extends Plugin {
     }
     await this.request("/api/attr/setBlockAttrs", {
       id: task.blockId,
-      attrs: buildTimeListAttrs(task, this.getTaskActivePomodoro(task)),
+      attrs: buildTimeListAttrs(task),
     });
   }
 
@@ -646,7 +631,8 @@ class TimeListPlugin extends Plugin {
   }
 
   async queryDailyTaskBlocks(date) {
-    if (!this.settings.notebookId) {
+    const dailyNoteId = await this.ensureExistingDailyNoteId(date);
+    if (!dailyNoteId) {
       return [];
     }
     const notebook = await this.ensureNotebookId();
@@ -654,6 +640,7 @@ class TimeListPlugin extends Plugin {
       "select id, markdown, content, ial, created, updated from blocks",
       `where box = '${escapeSql(notebook)}'`,
       "and type <> 'd'",
+      `and root_id = '${escapeSql(dailyNoteId)}'`,
       `and (markdown like '%${escapeSql(date)}%' or content like '%${escapeSql(date)}%')`,
       "order by created asc",
     ].join(" ");
@@ -689,8 +676,6 @@ class TimeListPlugin extends Plugin {
 
   mergeDailyTaskRecords(records, date) {
     let changed = false;
-    const activeCandidates = [];
-    const activeAbsences = new Map();
     const now = Date.now();
     this.pruneRecentLocalTaskChanges(now);
     for (const [blockId, deletedAt] of this.locallyDeletedBlockIds) {
@@ -727,11 +712,6 @@ class TimeListPlugin extends Plugin {
           summary: record.summary,
         };
         this.state.tasks.unshift(task);
-        if (record.activePomodoro && record.status === "pending") {
-          activeCandidates.push({ task, activePomodoro: record.activePomodoro, updatedAt: record.updatedAt || record.createdAt });
-        } else {
-          activeAbsences.set(task.id, record.updatedAt || record.createdAt || "");
-        }
         changed = true;
         return;
       }
@@ -767,11 +747,6 @@ class TimeListPlugin extends Plugin {
         task.pomodoros = mergedPomodoros;
         changed = true;
       }
-      if (record.activePomodoro && record.status === "pending") {
-        activeCandidates.push({ task, activePomodoro: record.activePomodoro, updatedAt: record.updatedAt || record.createdAt });
-      } else {
-        activeAbsences.set(task.id, record.updatedAt || record.createdAt || "");
-      }
     });
 
     const canRemoveMissingBlockTasks = now - this.lastDailyNoteWriteAt > 8000;
@@ -787,46 +762,7 @@ class TimeListPlugin extends Plugin {
         changed = true;
       }
     }
-    changed = this.mergeActivePomodoroFromRecords(activeCandidates, activeAbsences, date) || changed;
     return changed;
-  }
-
-  mergeActivePomodoroFromRecords(candidates, activeAbsences, date) {
-    const candidate = candidates
-      .map((item) => ({
-        task: item.task,
-        activePomodoro: normalizeActivePomodoro(item.activePomodoro, item.task.id),
-        updatedAt: Date.parse(item.updatedAt || "") || 0,
-      }))
-      .filter((item) => item.activePomodoro)
-      .sort((left, right) => left.updatedAt - right.updatedAt)
-      .at(-1);
-    const current = this.state.activePomodoro;
-
-    if (candidate) {
-      if (!current || activePomodoroSignature(current) !== activePomodoroSignature(candidate.activePomodoro)) {
-        this.state.activePomodoro = candidate.activePomodoro;
-        return true;
-      }
-      return false;
-    }
-
-    if (!current) {
-      return false;
-    }
-    const task = this.findTask(current.taskId);
-    if (!task || task.date !== date) {
-      this.state.activePomodoro = null;
-      return true;
-    }
-    if (normalizeTaskStatus(task) !== "pending") {
-      this.state.activePomodoro = null;
-      return true;
-    }
-    if (this.hasRecentLocalTaskChange(task, taskMergeKey(task, date))) {
-      return false;
-    }
-    return false;
   }
 
   canWriteDailyNote() {
@@ -838,20 +774,35 @@ class TimeListPlugin extends Plugin {
     return String(data?.content || data || "");
   }
 
-  async importHabitsForToday({ silent = true } = {}) {
-    if (this.habitImportPromise) {
-      return this.habitImportPromise;
+  async refreshToday({ silent = false } = {}) {
+    if (this.refreshPromise) {
+      return this.refreshPromise;
     }
-    this.habitImportPromise = this.runHabitImportForToday({ silent });
+    this.refreshPromise = (async () => {
+      await this.syncTodayFromDailyNote({ silent: true });
+      return this.createHabitTasksForToday({ silent });
+    })();
     try {
-      return await this.habitImportPromise;
+      return await this.refreshPromise;
     } finally {
-      this.habitImportPromise = null;
+      this.refreshPromise = null;
     }
   }
 
-  async runHabitImportForToday({ silent = true } = {}) {
-    if (!this.settings.autoImportHabits || !this.settings.habitDocId) {
+  async createHabitTasksForToday({ silent = true } = {}) {
+    if (!this.settings.habitDocId) {
+      return 0;
+    }
+    if (this.settings.autoAppendToDailyNote && !this.settings.notebookId) {
+      if (!silent) {
+        showMessage("请先在设置里选择日记笔记本。", 5000, "error");
+      }
+      return 0;
+    }
+    if (this.settings.autoAppendToDailyNote && !(await this.ensureExistingDailyNoteId())) {
+      if (!silent) {
+        showMessage("今天的日记文档不存在，请先在思源里手动创建。", 5000, "error");
+      }
       return 0;
     }
 
@@ -879,6 +830,16 @@ class TimeListPlugin extends Plugin {
     const existingKeys = new Set(this.state.tasks
       .filter((task) => task.date === date)
       .map((task) => normalizeTitleKey(task.title)));
+    if (this.settings.notebookId) {
+      try {
+        const rows = await this.queryDailyTaskBlocks(date);
+        parseDailyTaskRecordsFromRows(rows)
+          .filter((record) => record.date === date)
+          .forEach((record) => existingKeys.add(normalizeTitleKey(record.title)));
+      } catch (error) {
+        console.warn("[siyuan-time-list] failed to check existing habit tasks", error);
+      }
+    }
     const nextTitles = titles.filter((title) => !existingKeys.has(normalizeTitleKey(title)));
     if (nextTitles.length === 0) {
       if (!silent) {
@@ -935,6 +896,14 @@ class TimeListPlugin extends Plugin {
     const parsedTitles = parseTaskTitles(rawText);
     if (parsedTitles.length === 0) {
       showMessage("先写任务名称，一行一个。", 3000, "error");
+      return;
+    }
+    if (this.settings.autoAppendToDailyNote && !this.settings.notebookId) {
+      showMessage("请先在设置里选择日记笔记本。", 5000, "error");
+      return;
+    }
+    if (this.settings.autoAppendToDailyNote && !(await this.ensureExistingDailyNoteId())) {
+      showMessage("今天的日记文档不存在，请先在思源里手动创建。", 5000, "error");
       return;
     }
     const existingKeys = new Set(this.getTodayTasks().map((task) => normalizeTitleKey(task.title)));
@@ -1288,11 +1257,8 @@ class TimeListPlugin extends Plugin {
       pausedMs: 0,
       isPaused: false,
     };
-    this.lastActivePomodoroSyncAt = 0;
-    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
-    await this.persistPomodoroTask(task);
   }
 
   async pausePomodoro() {
@@ -1302,11 +1268,8 @@ class TimeListPlugin extends Plugin {
     }
     active.isPaused = true;
     active.pausedAt = Date.now();
-    this.lastActivePomodoroSyncAt = 0;
-    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
-    await this.persistPomodoroTask(this.findTask(active.taskId));
   }
 
   async resumePomodoro() {
@@ -1317,11 +1280,8 @@ class TimeListPlugin extends Plugin {
     active.pausedMs += Date.now() - active.pausedAt;
     active.isPaused = false;
     active.pausedAt = null;
-    this.lastActivePomodoroSyncAt = 0;
-    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
-    await this.persistPomodoroTask(this.findTask(active.taskId));
   }
 
   async finishPomodoro() {
@@ -1350,8 +1310,6 @@ class TimeListPlugin extends Plugin {
       showMessage(`已记录一个番茄：${formatMinutes(minutes)}`);
     }
     this.state.activePomodoro = null;
-    this.lastActivePomodoroSyncAt = 0;
-    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
     await this.persistPomodoroTask(task);
@@ -1388,32 +1346,6 @@ class TimeListPlugin extends Plugin {
       if (!silent) {
         showMessage(`番茄状态已本地保存，但同步日记失败：${error.message}`, 5000, "error");
       }
-    }
-  }
-
-  async syncActivePomodoroSnapshot(now = Date.now()) {
-    const active = this.state.activePomodoro;
-    if (!active || active.isPaused || !this.canWriteDailyNote() || this.activePomodoroSyncInFlight) {
-      return;
-    }
-    if (now - this.lastActivePomodoroSyncAt < ACTIVE_POMODORO_SYNC_INTERVAL_MS) {
-      return;
-    }
-    const minute = activePomodoroMinutes(active);
-    if (minute <= 0 || minute === this.lastActivePomodoroSyncMinute) {
-      return;
-    }
-    const task = this.findTask(active.taskId);
-    if (!task || normalizeTaskStatus(task) !== "pending") {
-      return;
-    }
-    this.activePomodoroSyncInFlight = true;
-    this.lastActivePomodoroSyncAt = now;
-    this.lastActivePomodoroSyncMinute = minute;
-    try {
-      await this.persistPomodoroTask(task, { silent: true });
-    } finally {
-      this.activePomodoroSyncInFlight = false;
     }
   }
 
@@ -1859,8 +1791,7 @@ class TimeListPlugin extends Plugin {
     root.querySelector("[data-action='open-setting']")?.addEventListener("click", () => this.openSetting());
     root.querySelector("[data-action='open-create-task']")?.addEventListener("click", () => this.openCreateTaskDialog());
     root.querySelector("[data-action='refresh']")?.addEventListener("click", async () => {
-      await this.syncTodayFromDailyNote({ silent: true });
-      await this.importHabitsForToday({ silent: false });
+      await this.refreshToday({ silent: false });
       this.render();
     });
     root.querySelectorAll("[data-action]").forEach((button) => {
@@ -1917,8 +1848,7 @@ class TimeListPlugin extends Plugin {
           this.calendarDate = shiftCalendarDate(this.calendarDate, this.calendarMode, 1);
           this.refreshCalendarDialog();
         } else if (action === "calendar-refresh") {
-          await this.syncTodayFromDailyNote({ silent: true });
-          await this.importHabitsForToday({ silent: false });
+          await this.refreshToday({ silent: false });
           this.refreshCalendarDialog();
           this.render();
         } else if (action === "calendar-jump-month") {
@@ -1940,10 +1870,6 @@ function clone(value) {
     return structuredClone(value);
   }
   return JSON.parse(JSON.stringify(value));
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function todayKey() {
@@ -2056,19 +1982,14 @@ function formatDailyTaskLine(task, status = normalizeTaskStatus(task), options =
   if (pomodoroMinutes > 0) {
     parts.push(`🍅${formatCompactMinutes(pomodoroMinutes)}`);
   }
-  const active = normalizeActivePomodoro(options.activePomodoro, options.activePomodoro?.taskId);
-  if (active) {
-    parts.push(`🍅${active.isPaused ? "⏸" : "▶"}${formatCompactMinutes(activePomodoroMinutes(active))}`);
-  }
   return parts.join(" ");
 }
 
-function buildTimeListAttrs(task, activePomodoro) {
+function buildTimeListAttrs(task) {
   const pomodoros = normalizePomodoros(task.pomodoros);
-  const active = normalizeActivePomodoro(activePomodoro, activePomodoro?.taskId);
   return {
     [POMODOROS_ATTR]: pomodoros.length ? JSON.stringify(pomodoros) : "",
-    [ACTIVE_POMODORO_ATTR]: active ? JSON.stringify(serializeActivePomodoro(active)) : "",
+    [ACTIVE_POMODORO_ATTR]: "",
   };
 }
 
@@ -2154,11 +2075,11 @@ function parseDailyTaskRecord(line, row = {}) {
     status,
     blockId: row.id || "",
     actualMinutes,
-      pomodoros: parsePomodoros(rawText, text, row),
-      activePomodoro: parseActivePomodoro(rawText, text, row),
-      summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
-    };
-  }
+    pomodoros: parsePomodoros(rawText, text, row),
+    activePomodoro: null,
+    summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
+  };
+}
 
 function stripTimeListComments(text) {
   return String(text || "").replace(/<!--\s*time-list:[\s\S]*?-->/g, "").trim();
@@ -2198,20 +2119,20 @@ function parseIalAttr(ial, key) {
 }
 
 function parsePomodoros(rawText, visibleText, row = {}) {
-  const parsed = parseTimeListAttr(row, POMODOROS_ATTR) || parseTimeListComment(rawText, "pomodoros");
-  const pomodoros = normalizePomodoros(parsed);
-  if (pomodoros.length > 0) {
-    return pomodoros;
-  }
-  const minutes = parsePomodoroMinutes(visibleText);
-  if (minutes <= 0) {
+  const visibleMinutes = parsePomodoroMinutes(visibleText);
+  if (visibleMinutes <= 0) {
     return [];
   }
+  const parsed = parseTimeListAttr(row, POMODOROS_ATTR) || parseTimeListComment(rawText, "pomodoros");
+  const pomodoros = normalizePomodoros(parsed);
+  if (pomodoros.length > 0 && totalPomodoroItemMinutes(pomodoros) === visibleMinutes) {
+    return pomodoros;
+  }
   return [{
-    id: `daily-aggregate-${minutes}`,
+    id: `daily-aggregate-${visibleMinutes}`,
     startedAt: "",
     endedAt: "",
-    minutes,
+    minutes: visibleMinutes,
   }];
 }
 
@@ -2261,48 +2182,58 @@ function parsePomodoroMinutes(text) {
   return 0;
 }
 
-function shouldSyncFromWsEvent(event, tasks) {
+function shouldSyncAfterDocumentSave(event, dailyNoteId) {
   const detail = event?.detail;
-  if (!detail) {
+  const cmd = String(detail?.cmd || "").toLowerCase();
+  if (!cmd) {
     return false;
   }
-  const haystack = safeStringify(detail);
-  if (!haystack) {
-    return false;
-  }
-  if (haystack.includes(todayKey())) {
+  if (cmd === "createdailynote") {
     return true;
   }
-  return tasks
-    .filter((task) => task.date === todayKey() && task.blockId)
-    .some((task) => haystack.includes(task.blockId));
+  if (cmd !== "savedoc" && cmd !== "refreshdoc") {
+    return false;
+  }
+  const rootIds = extractRootIdsFromWsDetail(detail);
+  if (rootIds.length === 0 || !dailyNoteId) {
+    return true;
+  }
+  return rootIds.includes(dailyNoteId);
 }
 
-function safeStringify(value) {
-  const seen = new WeakSet();
-  try {
-    return JSON.stringify(value, (key, item) => {
-      if (typeof item === "function") {
-        return undefined;
+function extractRootIdsFromWsDetail(detail) {
+  const rootIds = new Set();
+  const add = (value) => {
+    if (typeof value === "string" && value) {
+      rootIds.add(value);
+    }
+  };
+  const addMany = (values) => {
+    if (Array.isArray(values)) {
+      values.forEach(add);
+    }
+  };
+
+  addMany(detail?.context?.rootIDs);
+  addMany(detail?.data?.rootIDs);
+  add(detail?.data?.rootID);
+  add(detail?.data?.rootId);
+  add(detail?.data?.id);
+  if (Array.isArray(detail?.data)) {
+    detail.data.forEach((transaction) => {
+      add(transaction?.rootID);
+      add(transaction?.rootId);
+      add(transaction?.id);
+      addMany(transaction?.context?.rootIDs);
+      if (Array.isArray(transaction?.doOperations)) {
+        transaction.doOperations.forEach((operation) => {
+          add(operation?.rootID);
+          add(operation?.rootId);
+        });
       }
-      if (typeof Element !== "undefined" && item instanceof Element) {
-        return {
-          id: item.getAttribute("data-node-id") || item.id || "",
-          text: item.textContent || "",
-        };
-      }
-      if (item && typeof item === "object") {
-        if (seen.has(item)) {
-          return undefined;
-        }
-        seen.add(item);
-      }
-      return item;
     });
-  } catch (error) {
-    console.warn("[siyuan-time-list] failed to stringify ws event", error);
-    return "";
   }
+  return Array.from(rootIds);
 }
 
 function siyuanTimeToIso(value) {
@@ -2539,15 +2470,30 @@ function normalizePomodoros(pomodoros) {
 }
 
 function mergePomodoros(existing, incoming) {
+  const incomingItems = normalizePomodoros(incoming);
+  const incomingDetails = incomingItems.filter((item) => !isAggregatePomodoro(item));
+  const aggregates = incomingItems.filter(isAggregatePomodoro);
   const byKey = new Map();
-  [...normalizePomodoros(existing), ...normalizePomodoros(incoming)].forEach((item) => {
+  incomingDetails.forEach((item) => {
     byKey.set(item.id || `${item.startedAt}-${item.endedAt}-${item.minutes}`, item);
   });
+  if (byKey.size === 0 && aggregates.length > 0) {
+    const aggregate = aggregates.reduce((left, right) => left.minutes >= right.minutes ? left : right);
+    byKey.set(aggregate.id, aggregate);
+  }
   return Array.from(byKey.values()).sort((left, right) => {
     const leftTime = Date.parse(left.startedAt || left.endedAt || "") || 0;
     const rightTime = Date.parse(right.startedAt || right.endedAt || "") || 0;
     return leftTime - rightTime;
   });
+}
+
+function totalPomodoroItemMinutes(pomodoros) {
+  return normalizePomodoros(pomodoros).reduce((sum, item) => sum + item.minutes, 0);
+}
+
+function isAggregatePomodoro(item) {
+  return String(item?.id || "").startsWith("daily-aggregate-");
 }
 
 function pomodoroSignature(pomodoros) {
@@ -2676,34 +2622,29 @@ function renderPieSvg(tasks, total) {
     `;
   }
 
-  const radius = 46;
-  const circumference = 2 * Math.PI * radius;
-  let used = 0;
-  const circles = tasks.map((task, index) => {
-    const minutes = task.actualMinutes || 0;
-    const length = (minutes / total) * circumference;
-    const dashOffset = -used;
-    used += length;
-    return `
-      <circle
-        cx="60"
-        cy="60"
-        r="${radius}"
-        fill="transparent"
-        stroke="${PIE_COLORS[index % PIE_COLORS.length]}"
-        stroke-width="28"
-        stroke-dasharray="${length} ${circumference - length}"
-        stroke-dashoffset="${dashOffset}"
-        transform="rotate(-90 60 60)"
-      />
-    `;
-  }).join("");
+  const center = 60;
+  const outerRadius = 52;
+  const innerRadius = 32;
+  let startAngle = -90;
+  const slices = tasks.length === 1
+    ? `<circle cx="${center}" cy="${center}" r="${outerRadius}" fill="${PIE_COLORS[0]}" />`
+    : tasks.map((task, index) => {
+      const minutes = task.actualMinutes || 0;
+      const angle = (minutes / total) * 360;
+      const path = donutSlicePath(center, center, outerRadius, innerRadius, startAngle, startAngle + angle);
+      startAngle += angle;
+      return `
+        <path d="${path}" fill="${PIE_COLORS[index % PIE_COLORS.length]}" />
+      `;
+    }).join("");
 
   return `
     <div class="time-list-pie">
       <svg viewBox="0 0 120 120" role="img" aria-label="今日任务时间分布饼图">
-        <circle cx="60" cy="60" r="${radius}" fill="transparent" stroke="var(--b3-theme-surface-lighter)" stroke-width="28" />
-        ${circles}
+        <circle cx="${center}" cy="${center}" r="${outerRadius}" fill="var(--b3-theme-surface-lighter)" />
+        <circle cx="${center}" cy="${center}" r="${innerRadius}" fill="var(--b3-theme-background)" />
+        ${slices}
+        <circle cx="${center}" cy="${center}" r="${innerRadius}" fill="var(--b3-theme-background)" />
       </svg>
       <div class="time-list-pie-center">
         <strong>${formatMinutes(total)}</strong>
@@ -2711,6 +2652,34 @@ function renderPieSvg(tasks, total) {
       </div>
     </div>
   `;
+}
+
+function donutSlicePath(cx, cy, outerRadius, innerRadius, startAngle, endAngle) {
+  const normalizedEndAngle = Math.min(endAngle, startAngle + 359.999);
+  const largeArcFlag = normalizedEndAngle - startAngle > 180 ? 1 : 0;
+  const outerStart = polarPoint(cx, cy, outerRadius, startAngle);
+  const outerEnd = polarPoint(cx, cy, outerRadius, normalizedEndAngle);
+  const innerEnd = polarPoint(cx, cy, innerRadius, normalizedEndAngle);
+  const innerStart = polarPoint(cx, cy, innerRadius, startAngle);
+  return [
+    `M ${outerStart.x} ${outerStart.y}`,
+    `A ${outerRadius} ${outerRadius} 0 ${largeArcFlag} 1 ${outerEnd.x} ${outerEnd.y}`,
+    `L ${innerEnd.x} ${innerEnd.y}`,
+    `A ${innerRadius} ${innerRadius} 0 ${largeArcFlag} 0 ${innerStart.x} ${innerStart.y}`,
+    "Z",
+  ].join(" ");
+}
+
+function polarPoint(cx, cy, radius, angle) {
+  const radians = (angle * Math.PI) / 180;
+  return {
+    x: roundSvgNumber(cx + radius * Math.cos(radians)),
+    y: roundSvgNumber(cy + radius * Math.sin(radians)),
+  };
+}
+
+function roundSvgNumber(value) {
+  return Number(value.toFixed(3));
 }
 
 function escapeHtml(value) {
