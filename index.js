@@ -13,6 +13,9 @@ const DATA_KEY = "time-list-data.json";
 const SETTINGS_KEY = "time-list-settings.json";
 const DOCK_TYPE = "time-list";
 const REALTIME_SYNC_INTERVAL_MS = 2000;
+const ACTIVE_POMODORO_SYNC_INTERVAL_MS = 60000;
+const POMODOROS_ATTR = "custom-time-list-pomodoros";
+const ACTIVE_POMODORO_ATTR = "custom-time-list-active-pomodoro";
 const PIE_COLORS = ["#5b8def", "#f59e0b", "#10b981", "#ef4444", "#8b5cf6", "#06b6d4", "#f97316", "#84cc16"];
 const WEEKDAY_SHORT = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"];
 const ICONS = `
@@ -70,7 +73,10 @@ class TimeListPlugin extends Plugin {
     this.boundWsMainHandler = null;
     this.lastDailyNoteWriteAt = 0;
     this.lastRealtimeSyncAt = 0;
+    this.lastActivePomodoroSyncAt = 0;
+    this.lastActivePomodoroSyncMinute = -1;
     this.realtimeSyncInFlight = false;
+    this.activePomodoroSyncInFlight = false;
     this.locallyDeletedBlockIds = new Map();
     this.recentLocalTaskChanges = new Map();
     this.isMobile = false;
@@ -426,6 +432,7 @@ class TimeListPlugin extends Plugin {
         this.render();
       }
       const now = Date.now();
+      await this.syncActivePomodoroSnapshot(now);
       if (this.shouldRealtimeSync(now)) {
         this.lastRealtimeSyncAt = now;
         await this.syncDockFromDailyNote();
@@ -551,7 +558,10 @@ class TimeListPlugin extends Plugin {
       return false;
     }
     this.lastDailyNoteWriteAt = Date.now();
-    const markdown = formatDailyTaskRecord(task, status, options);
+    const markdown = formatDailyTaskRecord(task, status, {
+      ...options,
+      activePomodoro: this.getTaskActivePomodoro(task),
+    });
     let changed = false;
     if (!task.blockId) {
       task.blockId = await this.findDailyTaskBlockId(task);
@@ -564,6 +574,7 @@ class TimeListPlugin extends Plugin {
           dataType: "markdown",
           data: markdown,
         });
+        await this.setDailyTaskMetadataAttrs(task);
         this.lastDailyNoteWriteAt = Date.now();
         return changed;
       } catch (error) {
@@ -576,14 +587,28 @@ class TimeListPlugin extends Plugin {
     const blockId = extractBlockId(result);
     if (blockId) {
       task.blockId = blockId;
+      await this.setDailyTaskMetadataAttrs(task);
       this.lastDailyNoteWriteAt = Date.now();
       this.markRecentLocalTaskChange(task);
       return true;
     }
     task.blockId = await this.findDailyTaskBlockId(task);
+    if (task.blockId) {
+      await this.setDailyTaskMetadataAttrs(task);
+    }
     this.lastDailyNoteWriteAt = Date.now();
     this.markRecentLocalTaskChange(task);
     return Boolean(task.blockId) || changed;
+  }
+
+  async setDailyTaskMetadataAttrs(task) {
+    if (!task?.blockId) {
+      return;
+    }
+    await this.request("/api/attr/setBlockAttrs", {
+      id: task.blockId,
+      attrs: buildTimeListAttrs(task, this.getTaskActivePomodoro(task)),
+    });
   }
 
   async findDailyTaskBlockId(task) {
@@ -625,7 +650,7 @@ class TimeListPlugin extends Plugin {
     }
     const notebook = await this.ensureNotebookId();
     const stmt = [
-      "select id, markdown, content, created, updated from blocks",
+      "select id, markdown, content, ial, created, updated from blocks",
       `where box = '${escapeSql(notebook)}'`,
       "and type <> 'd'",
       `and (markdown like '%${escapeSql(date)}%' or content like '%${escapeSql(date)}%')`,
@@ -663,6 +688,8 @@ class TimeListPlugin extends Plugin {
 
   mergeDailyTaskRecords(records, date) {
     let changed = false;
+    const activeCandidates = [];
+    const activeAbsences = new Map();
     const now = Date.now();
     this.pruneRecentLocalTaskChanges(now);
     for (const [blockId, deletedAt] of this.locallyDeletedBlockIds) {
@@ -694,11 +721,16 @@ class TimeListPlugin extends Plugin {
           abandonedAt: record.status === "abandoned" ? new Date().toISOString() : "",
           actualMinutes: record.actualMinutes,
           completionMode: record.status === "completed" ? "document" : "",
-          pomodoros: [],
+          pomodoros: normalizePomodoros(record.pomodoros),
           note: record.status === "completed" ? "文档同步" : "",
           summary: record.summary,
         };
         this.state.tasks.unshift(task);
+        if (record.activePomodoro && record.status === "pending") {
+          activeCandidates.push({ task, activePomodoro: record.activePomodoro, updatedAt: record.updatedAt || record.createdAt });
+        } else {
+          activeAbsences.set(task.id, record.updatedAt || record.createdAt || "");
+        }
         changed = true;
         return;
       }
@@ -711,6 +743,7 @@ class TimeListPlugin extends Plugin {
         return;
       }
 
+      const mergedPomodoros = mergePomodoros(task.pomodoros, record.pomodoros);
       const nextValues = {
         title: record.title,
         date: record.date,
@@ -729,6 +762,15 @@ class TimeListPlugin extends Plugin {
           changed = true;
         }
       });
+      if (pomodoroSignature(task.pomodoros) !== pomodoroSignature(mergedPomodoros)) {
+        task.pomodoros = mergedPomodoros;
+        changed = true;
+      }
+      if (record.activePomodoro && record.status === "pending") {
+        activeCandidates.push({ task, activePomodoro: record.activePomodoro, updatedAt: record.updatedAt || record.createdAt });
+      } else {
+        activeAbsences.set(task.id, record.updatedAt || record.createdAt || "");
+      }
     });
 
     const canRemoveMissingBlockTasks = now - this.lastDailyNoteWriteAt > 8000;
@@ -744,7 +786,43 @@ class TimeListPlugin extends Plugin {
         changed = true;
       }
     }
+    changed = this.mergeActivePomodoroFromRecords(activeCandidates, activeAbsences, date) || changed;
     return changed;
+  }
+
+  mergeActivePomodoroFromRecords(candidates, activeAbsences, date) {
+    const candidate = candidates
+      .map((item) => ({
+        task: item.task,
+        activePomodoro: normalizeActivePomodoro(item.activePomodoro, item.task.id),
+        updatedAt: Date.parse(item.updatedAt || "") || 0,
+      }))
+      .filter((item) => item.activePomodoro)
+      .sort((left, right) => left.updatedAt - right.updatedAt)
+      .at(-1);
+    const current = this.state.activePomodoro;
+
+    if (candidate) {
+      if (!current || activePomodoroSignature(current) !== activePomodoroSignature(candidate.activePomodoro)) {
+        this.state.activePomodoro = candidate.activePomodoro;
+        return true;
+      }
+      return false;
+    }
+
+    if (!current) {
+      return false;
+    }
+    const task = this.findTask(current.taskId);
+    if (!task || task.date !== date || this.hasRecentLocalTaskChange(task, taskMergeKey(task, date))) {
+      return false;
+    }
+    const absentUpdatedAt = Date.parse(activeAbsences.get(task.id) || "") || 0;
+    if (!absentUpdatedAt || absentUpdatedAt < (Number(current.startedAt) || 0)) {
+      return false;
+    }
+    this.state.activePomodoro = null;
+    return true;
   }
 
   canWriteDailyNote() {
@@ -986,7 +1064,7 @@ class TimeListPlugin extends Plugin {
       this.completeTaskDialog = null;
     }
 
-    const pomodoroMinutes = totalPomodoroMinutes(task);
+    const pomodoroMinutes = this.getTaskPomodoroMinutes(task);
     const content = `
       <div class="time-list-dialog time-list-complete-dialog" data-selected-mode="manual">
         <div class="time-list-dialog-title">${escapeHtml(task.title)}</div>
@@ -1094,7 +1172,7 @@ class TimeListPlugin extends Plugin {
       return clampNumber(payload.minutes, 0, 24 * 60, 0);
     }
     if (mode === "pomodoro") {
-      return totalPomodoroMinutes(task);
+      return this.getTaskPomodoroMinutes(task);
     }
     return 0;
   }
@@ -1194,8 +1272,11 @@ class TimeListPlugin extends Plugin {
       pausedMs: 0,
       isPaused: false,
     };
+    this.lastActivePomodoroSyncAt = 0;
+    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
+    await this.persistPomodoroTask(task);
   }
 
   async pausePomodoro() {
@@ -1205,8 +1286,11 @@ class TimeListPlugin extends Plugin {
     }
     active.isPaused = true;
     active.pausedAt = Date.now();
+    this.lastActivePomodoroSyncAt = 0;
+    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
+    await this.persistPomodoroTask(this.findTask(active.taskId));
   }
 
   async resumePomodoro() {
@@ -1217,8 +1301,11 @@ class TimeListPlugin extends Plugin {
     active.pausedMs += Date.now() - active.pausedAt;
     active.isPaused = false;
     active.pausedAt = null;
+    this.lastActivePomodoroSyncAt = 0;
+    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
+    await this.persistPomodoroTask(this.findTask(active.taskId));
   }
 
   async finishPomodoro() {
@@ -1247,12 +1334,71 @@ class TimeListPlugin extends Plugin {
       showMessage(`已记录一个番茄：${formatMinutes(minutes)}`);
     }
     this.state.activePomodoro = null;
+    this.lastActivePomodoroSyncAt = 0;
+    this.lastActivePomodoroSyncMinute = -1;
     await this.saveState();
     this.render();
+    await this.persistPomodoroTask(task);
   }
 
   findTask(taskId) {
     return this.state.tasks.find((task) => task.id === taskId);
+  }
+
+  getTaskActivePomodoro(task) {
+    const active = this.state.activePomodoro;
+    if (!active || !task || active.taskId !== task.id || normalizeTaskStatus(task) !== "pending") {
+      return null;
+    }
+    return active;
+  }
+
+  getTaskPomodoroMinutes(task) {
+    return totalPomodoroMinutes(task) + activePomodoroMinutes(this.getTaskActivePomodoro(task));
+  }
+
+  async persistPomodoroTask(task, { silent = false } = {}) {
+    if (!task || !this.canWriteDailyNote()) {
+      return;
+    }
+    this.markRecentLocalTaskChange(task);
+    try {
+      const changed = await this.writeTaskToDailyNote(task, normalizeTaskStatus(task));
+      if (changed) {
+        await this.saveState();
+      }
+    } catch (error) {
+      console.warn("[siyuan-time-list] failed to persist pomodoro state", error);
+      if (!silent) {
+        showMessage(`番茄状态已本地保存，但同步日记失败：${error.message}`, 5000, "error");
+      }
+    }
+  }
+
+  async syncActivePomodoroSnapshot(now = Date.now()) {
+    const active = this.state.activePomodoro;
+    if (!active || active.isPaused || !this.canWriteDailyNote() || this.activePomodoroSyncInFlight) {
+      return;
+    }
+    if (now - this.lastActivePomodoroSyncAt < ACTIVE_POMODORO_SYNC_INTERVAL_MS) {
+      return;
+    }
+    const minute = activePomodoroMinutes(active);
+    if (minute <= 0 || minute === this.lastActivePomodoroSyncMinute) {
+      return;
+    }
+    const task = this.findTask(active.taskId);
+    if (!task || normalizeTaskStatus(task) !== "pending") {
+      return;
+    }
+    this.activePomodoroSyncInFlight = true;
+    this.lastActivePomodoroSyncAt = now;
+    this.lastActivePomodoroSyncMinute = minute;
+    try {
+      await this.persistPomodoroTask(task, { silent: true });
+    } finally {
+      this.activePomodoroSyncInFlight = false;
+    }
   }
 
   markRecentLocalTaskChange(task) {
@@ -1287,6 +1433,7 @@ class TimeListPlugin extends Plugin {
         status: normalizeTaskStatus(task),
         actualMinutes: task.actualMinutes || 0,
         pomodoroMinutes: totalPomodoroMinutes(task),
+        activePomodoro: activePomodoroSignature(this.getTaskActivePomodoro(task)),
         summary: task.summary || "",
         blockId: task.blockId || "",
       }))
@@ -1579,7 +1726,7 @@ class TimeListPlugin extends Plugin {
 
   renderChart(todayTasks, completedTasks, abandonedTasks) {
     const total = completedTasks.reduce((sum, task) => sum + (task.actualMinutes || 0), 0);
-    const totalPomodoro = todayTasks.reduce((sum, task) => sum + totalPomodoroMinutes(task), 0);
+    const totalPomodoro = todayTasks.reduce((sum, task) => sum + this.getTaskPomodoroMinutes(task), 0);
     const distributionTasks = completedTasks
       .slice()
       .sort((a, b) => (b.actualMinutes || 0) - (a.actualMinutes || 0))
@@ -1633,7 +1780,7 @@ class TimeListPlugin extends Plugin {
   }
 
   renderTaskItem(task) {
-    const pomodoroMinutes = totalPomodoroMinutes(task);
+    const pomodoroMinutes = this.getTaskPomodoroMinutes(task);
     const status = normalizeTaskStatus(task);
     const minutes = status === "completed" ? task.actualMinutes : pomodoroMinutes;
     const timeText = minutes ? formatCompactMinutes(minutes) : "0m";
@@ -1849,6 +1996,7 @@ function isMetadataLine(line) {
 function cleanTaskLine(line) {
   return String(line)
     .trim()
+    .replace(/<!--\s*time-list:[\s\S]*?-->/g, "")
     .replace(/^[-*+]\s+/, "")
     .replace(/^\d+[.)、]\s+/, "")
     .replace(/^\[[ xX]\]\s+/, "")
@@ -1856,6 +2004,7 @@ function cleanTaskLine(line) {
     .replace(/\s*(?:\uD83D\uDCC5)?\s*\d{4}-\d{2}-\d{2}\s*/g, " ")
     .replace(/\s*(✅|✔️|☑️|🚫|❌)\s*/g, " ")
     .replace(/\s*⏱\s*\S+\s*/g, " ")
+    .replace(/\s*🍅\s*\S+\s*/g, " ")
     .replace(/\s*用时\s*\S+\s*/g, " ")
     .replace(/\s*📝.*$/g, "")
     .replace(/\s*#\S+#?\s*$/g, "")
@@ -1887,7 +2036,24 @@ function formatDailyTaskLine(task, status = normalizeTaskStatus(task), options =
   } else if (status === "abandoned") {
     parts.push("🚫");
   }
+  const pomodoroMinutes = totalPomodoroMinutes(task);
+  if (pomodoroMinutes > 0) {
+    parts.push(`🍅${formatCompactMinutes(pomodoroMinutes)}`);
+  }
+  const active = normalizeActivePomodoro(options.activePomodoro, options.activePomodoro?.taskId);
+  if (active) {
+    parts.push(`🍅${active.isPaused ? "⏸" : "▶"}${formatCompactMinutes(activePomodoroMinutes(active))}`);
+  }
   return parts.join(" ");
+}
+
+function buildTimeListAttrs(task, activePomodoro) {
+  const pomodoros = normalizePomodoros(task.pomodoros);
+  const active = normalizeActivePomodoro(activePomodoro, activePomodoro?.taskId);
+  return {
+    [POMODOROS_ATTR]: pomodoros.length ? JSON.stringify(pomodoros) : "",
+    [ACTIVE_POMODORO_ATTR]: active ? JSON.stringify(serializeActivePomodoro(active)) : "",
+  };
 }
 
 function normalizeTitleKey(title) {
@@ -1924,8 +2090,8 @@ function compareDailyTaskRecord(left, right) {
   if (statusDiff !== 0) {
     return statusDiff;
   }
-  const leftTime = Date.parse(left.createdAt || "") || 0;
-  const rightTime = Date.parse(right.createdAt || "") || 0;
+  const leftTime = Date.parse(left.updatedAt || left.createdAt || "") || 0;
+  const rightTime = Date.parse(right.updatedAt || right.createdAt || "") || 0;
   if (leftTime !== rightTime) {
     return leftTime - rightTime;
   }
@@ -1945,6 +2111,7 @@ function parseDailyTaskRecordsFromRows(rows) {
         ...record,
         blockId: parsedLines.length === 1 ? row.id : "",
         createdAt: row.created ? siyuanTimeToIso(row.created) : "",
+        updatedAt: row.updated ? siyuanTimeToIso(row.updated) : "",
       });
     });
   });
@@ -1952,7 +2119,8 @@ function parseDailyTaskRecordsFromRows(rows) {
 }
 
 function parseDailyTaskRecord(line, row = {}) {
-  const text = String(line || "").trim();
+  const rawText = String(line || "").trim();
+  const text = stripTimeListComments(rawText);
   const dateMatch = /(?:\uD83D\uDCC5\s*)?(\d{4}-\d{2}-\d{2})/.exec(text);
   if (!dateMatch) {
     return null;
@@ -1970,8 +2138,69 @@ function parseDailyTaskRecord(line, row = {}) {
     status,
     blockId: row.id || "",
     actualMinutes,
+    pomodoros: parsePomodoros(rawText, text, row),
+    activePomodoro: parseActivePomodoro(rawText, row),
     summary: summaryMatch ? unescapeMarkdown(summaryMatch[1].trim()) : "",
   };
+}
+
+function stripTimeListComments(text) {
+  return String(text || "").replace(/<!--\s*time-list:[\s\S]*?-->/g, "").trim();
+}
+
+function parseTimeListComment(text, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`<!--\\s*time-list:${escapedKey}\\s+([\\s\\S]*?)\\s*-->`).exec(String(text || ""));
+  if (!match) {
+    return null;
+  }
+  try {
+    return JSON.parse(match[1]);
+  } catch (error) {
+    console.warn("[siyuan-time-list] failed to parse metadata comment", error);
+    return null;
+  }
+}
+
+function parseTimeListAttr(row, key) {
+  const value = row?.[key] ?? parseIalAttr(row?.ial, key);
+  if (!value) {
+    return null;
+  }
+  try {
+    return JSON.parse(unescapeHtmlEntities(value));
+  } catch (error) {
+    console.warn("[siyuan-time-list] failed to parse metadata attr", error);
+    return null;
+  }
+}
+
+function parseIalAttr(ial, key) {
+  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`${escapedKey}="([^"]*)"`).exec(String(ial || ""));
+  return match ? match[1] : "";
+}
+
+function parsePomodoros(rawText, visibleText, row = {}) {
+  const parsed = parseTimeListAttr(row, POMODOROS_ATTR) || parseTimeListComment(rawText, "pomodoros");
+  const pomodoros = normalizePomodoros(parsed);
+  if (pomodoros.length > 0) {
+    return pomodoros;
+  }
+  const minutes = parsePomodoroMinutes(visibleText);
+  if (minutes <= 0) {
+    return [];
+  }
+  return [{
+    id: `daily-aggregate-${minutes}`,
+    startedAt: "",
+    endedAt: "",
+    minutes,
+  }];
+}
+
+function parseActivePomodoro(rawText, row = {}) {
+  return normalizeActivePomodoro(parseTimeListAttr(row, ACTIVE_POMODORO_ATTR) || parseTimeListComment(rawText, "active-pomodoro"));
 }
 
 function parseTaskMinutes(text) {
@@ -1982,6 +2211,14 @@ function parseTaskMinutes(text) {
   const minuteMatch = /用时\s*(\d+)\s*(?:分钟|m)?/i.exec(text);
   if (minuteMatch) {
     return Number(minuteMatch[1]) || 0;
+  }
+  return 0;
+}
+
+function parsePomodoroMinutes(text) {
+  const match = /🍅\s*(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?/i.exec(String(text || ""));
+  if (match && (match[1] || match[2])) {
+    return (Number(match[1]) || 0) * 60 + (Number(match[2]) || 0);
   }
   return 0;
 }
@@ -2236,6 +2473,96 @@ function totalPomodoroMinutes(task) {
   return (task.pomodoros || []).reduce((sum, item) => sum + (Number(item.minutes) || 0), 0);
 }
 
+function activePomodoroMinutes(active) {
+  if (!active) {
+    return 0;
+  }
+  return Math.max(0, Math.round(getActiveElapsedMs(active) / 60000));
+}
+
+function normalizePomodoros(pomodoros) {
+  if (!Array.isArray(pomodoros)) {
+    return [];
+  }
+  return pomodoros
+    .map((item) => {
+      const minutes = Number(item?.minutes) || 0;
+      if (minutes <= 0) {
+        return null;
+      }
+      return {
+        id: String(item.id || `${item.startedAt || ""}-${item.endedAt || ""}-${minutes}`),
+        startedAt: String(item.startedAt || ""),
+        endedAt: String(item.endedAt || ""),
+        minutes,
+      };
+    })
+    .filter(Boolean);
+}
+
+function mergePomodoros(existing, incoming) {
+  const byKey = new Map();
+  [...normalizePomodoros(existing), ...normalizePomodoros(incoming)].forEach((item) => {
+    byKey.set(item.id || `${item.startedAt}-${item.endedAt}-${item.minutes}`, item);
+  });
+  return Array.from(byKey.values()).sort((left, right) => {
+    const leftTime = Date.parse(left.startedAt || left.endedAt || "") || 0;
+    const rightTime = Date.parse(right.startedAt || right.endedAt || "") || 0;
+    return leftTime - rightTime;
+  });
+}
+
+function pomodoroSignature(pomodoros) {
+  return JSON.stringify(normalizePomodoros(pomodoros));
+}
+
+function normalizeActivePomodoro(active, taskId = active?.taskId) {
+  if (!active) {
+    return null;
+  }
+  const startedAt = normalizeTimestamp(active.startedAt);
+  if (!startedAt) {
+    return null;
+  }
+  const isPaused = Boolean(active.isPaused);
+  const pausedAt = isPaused ? normalizeTimestamp(active.pausedAt) || startedAt : null;
+  return {
+    id: String(active.id || `${taskId || ""}-${startedAt}`),
+    taskId: taskId || active.taskId || "",
+    startedAt,
+    pausedAt,
+    pausedMs: Math.max(0, Number(active.pausedMs) || 0),
+    isPaused,
+  };
+}
+
+function serializeActivePomodoro(active) {
+  const normalized = normalizeActivePomodoro(active, active?.taskId);
+  if (!normalized) {
+    return null;
+  }
+  return {
+    id: normalized.id,
+    startedAt: new Date(normalized.startedAt).toISOString(),
+    pausedAt: normalized.pausedAt ? new Date(normalized.pausedAt).toISOString() : "",
+    pausedMs: normalized.pausedMs,
+    isPaused: normalized.isPaused,
+  };
+}
+
+function activePomodoroSignature(active) {
+  const normalized = normalizeActivePomodoro(active, active?.taskId);
+  return normalized ? JSON.stringify(normalized) : "";
+}
+
+function normalizeTimestamp(value) {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  const parsed = Date.parse(String(value || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 function getActiveElapsedMs(active) {
   const now = active.isPaused ? active.pausedAt : Date.now();
   return Math.max(0, now - active.startedAt - (active.pausedMs || 0));
@@ -2355,6 +2682,16 @@ function escapeHtml(value) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+function unescapeHtmlEntities(value) {
+  return String(value)
+    .replace(/&quot;/g, "\"")
+    .replace(/&#039;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&amp;/g, "&");
 }
 
 function escapeMarkdown(value) {
